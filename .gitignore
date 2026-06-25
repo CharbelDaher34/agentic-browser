@@ -14,3 +14,7 @@ frontend/dist/
 
 # uv
 .python-version
+computers/
+.agents/
+# BYOK encryption key
+.app_secret

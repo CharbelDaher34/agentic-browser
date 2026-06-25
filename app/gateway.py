@@ -23,7 +23,9 @@ WebSockets (token via ?token=):
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import struct
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -31,7 +33,6 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .auth import (
@@ -46,6 +47,7 @@ from .auth import (
 )
 from .config import ROOT, settings
 from .models import ProviderName, StreamEvent
+from .models_registry import KEY_PROVIDERS
 from .recorder import LocalArtifacts, Recorder
 from .registry import SessionRegistry
 from .runner import Runner
@@ -95,6 +97,10 @@ Path(settings().artifacts_dir).mkdir(parents=True, exist_ok=True)
 class Credentials(BaseModel):
     username: str
     password: str
+
+
+class ApiKeyIn(BaseModel):
+    key: str
 
 
 class CreateSession(BaseModel):
@@ -152,6 +158,35 @@ async def logout(
     return {"ok": True}
 
 
+# --- BYOK: per-user model API keys ------------------------------------------
+# Supported providers come from the model registry (single source of truth).
+
+
+@app.get("/api/keys")
+async def list_keys(user: dict = Depends(current_user)):
+    store: Store = app.state.store
+    have = set(await store.list_key_providers(user["user_id"]))
+    # report which providers the user has set (never return the keys themselves)
+    return {"providers": {p: (p in have) for p in sorted(KEY_PROVIDERS)}}
+
+
+@app.put("/api/keys/{provider}")
+async def set_key(provider: str, body: ApiKeyIn, user: dict = Depends(current_user)):
+    if provider not in KEY_PROVIDERS:
+        raise HTTPException(400, "Unknown provider")
+    key = (body.key or "").strip()
+    if not key:
+        raise HTTPException(400, "Empty key")
+    await app.state.store.save_api_key(user["user_id"], provider, key)
+    return {"ok": True}
+
+
+@app.delete("/api/keys/{provider}")
+async def delete_key(provider: str, user: dict = Depends(current_user)):
+    await app.state.store.delete_api_key(user["user_id"], provider)
+    return {"ok": True}
+
+
 # --- browser sessions --------------------------------------------------------
 @app.post("/api/sessions")
 async def create_session(body: CreateSession, user: dict = Depends(current_user)):
@@ -197,6 +232,8 @@ async def session_detail(session_id: str, user: dict = Depends(current_user)):
         detail["live_view_mode"] = s.live_view_mode
         detail["live_view_url"] = s.live_view_url
         detail["lease"] = registry.lease_state(session_id)
+        detail["tabs"] = s.list_tabs()
+        detail["lease_states"] = registry.lease_states(session_id)
     return detail
 
 
@@ -291,34 +328,55 @@ async def chat_ws(ws: WebSocket, chat_id: str):
         return
     session_id = chat["session_id"]
 
-    async def emit(ev: StreamEvent) -> None:
-        try:
-            await ws.send_text(json.dumps({"type": ev.type, "data": dict(ev.data)}))
-        except Exception:  # noqa: BLE001 — client went away mid-stream
-            pass
+    # Ordered, single-writer streaming: agent tools emit `action`/`observation`
+    # from PydanticAI's internal graph task, while the runner emits `token`/
+    # `tool_call` from the event-consumer task. Those are two concurrent tasks,
+    # so calling ws.send_text from both races (interleaved/corrupt frames). We
+    # funnel every event through one queue (put_nowait preserves production
+    # order) and a single sender task is the only thing that touches the socket.
+    send_q: asyncio.Queue = asyncio.Queue()
 
-    tasks: set = ws.app.state.tasks
+    async def emit(ev: StreamEvent) -> None:
+        send_q.put_nowait(ev)
+
+    async def sender() -> None:
+        while True:
+            ev = await send_q.get()
+            try:
+                await ws.send_text(json.dumps({"type": ev.type, "data": dict(ev.data)}))
+            except Exception:  # noqa: BLE001 — client went away mid-stream
+                break
+            finally:
+                send_q.task_done()
+
+    sender_task = asyncio.create_task(sender())
     try:
         while True:
             msg = json.loads(await ws.receive_text())
             kind = msg.get("kind")
             if kind == "user_message":
-                # keep a reference so the fire-and-forget turn isn't GC'd mid-run
-                task = asyncio.create_task(
-                    runner.run_turn(session_id, chat_id, msg["text"], emit)
-                )
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
+                # start_turn INTERRUPTS any in-flight turn first (mid-run steering),
+                # persisting partial context, then launches the new turn. The runner
+                # owns the task reference, so it isn't GC'd mid-run.
+                await runner.start_turn(session_id, chat_id, msg["text"], emit, user_id)
+            elif kind == "interrupt":
+                await runner.stop(chat_id)
             elif kind == "approval":
                 await runner.submit_approval(chat_id, msg["decisions"])
     except WebSocketDisconnect:
-        # unblock any run_turn waiting on an approval from this (now gone) client,
-        # so it unwinds and releases the lease instead of deadlocking.
+        # stop the running turn so it unwinds, releases every lease, and persists
+        # partial context instead of deadlocking on a now-gone client.
+        await runner.stop(chat_id)
         runner.cancel_pending(chat_id)
         registry.detach(session_id, chat_id)
+    finally:
+        sender_task.cancel()
 
 
 # --- live view + takeover plane ---------------------------------------------
+_FRAME_TICK = object()  # sentinel: "a fresh frame is waiting in the coalescing slot"
+
+
 @app.websocket("/ws/view/{session_id}")
 async def view_ws(ws: WebSocket, session_id: str):
     await ws.accept()
@@ -338,57 +396,133 @@ async def view_ws(ws: WebSocket, session_id: str):
 
     session = registry.get(session_id)
 
-    await ws.send_text(
-        json.dumps(
-            {
-                "type": "live_view",
-                "mode": session.live_view_mode,
-                "url": session.live_view_url,
-            }
-        )
-    )
+    # Single-writer streaming (mirrors chat_ws): the CDP screencast callback fires
+    # from a separate task and the receive loop also sends (lease/tabs). Writing the
+    # socket from both races and trips the websockets keepalive AssertionError, so
+    # ALL writes funnel through one queue drained by one sender task.
+    send_q: asyncio.Queue = asyncio.Queue()
+    # frame coalescing: keep only the newest JPEG so a slow client gets the freshest
+    # frame, never a growing backlog.
+    latest = {"b64": None, "tab_id": None, "pending": False}
 
-    async def send_frame(b64: str) -> None:
-        try:
-            await ws.send_text(json.dumps({"type": "frame", "data": b64}))
-        except Exception:  # noqa: BLE001
-            pass
+    def enqueue(obj) -> None:
+        send_q.put_nowait(obj)
 
-    if session.live_view_mode == "screencast":
-        session.subscribe(send_frame)
+    async def sender() -> None:
+        while True:
+            item = await send_q.get()
+            try:
+                if item is _FRAME_TICK:
+                    latest["pending"] = False
+                    b64, tab = latest["b64"], latest["tab_id"]
+                    if b64 is None:
+                        continue
+                    latest["b64"] = None
+                    w, h = session.screen_size_of(tab)
+                    # binary frame: [ver=1][w u16][h u16][tab_len u8][tab][jpeg]
+                    # ~35% smaller than base64-in-JSON, no quality loss.
+                    jpeg = base64.b64decode(b64)
+                    tb = (tab or "t0").encode()
+                    header = struct.pack(">BHHB", 1, w & 0xFFFF, h & 0xFFFF, len(tb))
+                    await ws.send_bytes(header + tb + jpeg)
+                else:
+                    await ws.send_text(json.dumps(item))  # control msgs stay JSON
+            except Exception:  # noqa: BLE001 — client went away
+                break
 
-    lease_token: str | None = None
+    sender_task = asyncio.create_task(sender())
+
+    enqueue({"type": "live_view", "mode": session.live_view_mode,
+             "url": session.live_view_url})
+    enqueue({"type": "tabs", "tabs": session.list_tabs(),
+             "leases": registry.lease_states(session_id)})
+
+    # ---- per-tab frame subscription (one watched tab at a time) ----
+    sub = {"fn": None, "tab": None}
+
+    def watch(tab_id: str) -> None:
+        if session.live_view_mode != "screencast" or not session.has_tab(tab_id):
+            return
+        if sub["fn"] is not None:
+            session.unsubscribe(sub["fn"], sub["tab"])
+
+        async def on_frame(b64: str, _tab=tab_id) -> None:
+            latest["b64"], latest["tab_id"] = b64, _tab
+            if not latest["pending"]:
+                latest["pending"] = True
+                enqueue(_FRAME_TICK)
+
+        sub["fn"], sub["tab"] = on_frame, tab_id
+        session.subscribe(on_frame, tab_id)
+
+    async def push_initial(tab_id: str) -> None:
+        # Hand the viewer the current page right away — the CDP screencast only
+        # emits on repaint, so a static page would otherwise show no frame.
+        if session.live_view_mode != "screencast" or not session.has_tab(tab_id):
+            return
+        b64 = await session.frame_jpeg_b64(tab_id)
+        if b64:
+            # route through the same coalescing slot so it ships as a binary frame
+            latest["b64"], latest["tab_id"] = b64, tab_id
+            if not latest["pending"]:
+                latest["pending"] = True
+                enqueue(_FRAME_TICK)
+
+    watch("t0")
+    await push_initial("t0")
+
+    leases: dict[str, str] = {}   # tab_id -> human lease token
+
+    def _send_lease(tab_id: str, granted: bool) -> None:
+        driver = "human" if granted else registry.lease_state(session_id, tab_id)["driver"]
+        enqueue({"type": "lease", "granted": granted, "driver": driver, "tab_id": tab_id})
+
     try:
         while True:
             msg = json.loads(await ws.receive_text())
             kind = msg["kind"]
-            if kind == "take_over":
-                lease = await registry.acquire(session_id, "human", user_id)
-                lease_token = lease.token if lease else None
-                await ws.send_text(
-                    json.dumps({"type": "lease", "granted": lease is not None,
-                                "driver": "human" if lease else
-                                registry.lease_state(session_id)["driver"]})
-                )
-            elif kind == "release" and lease_token:
-                await registry.release(session_id, lease_token)
-                lease_token = None
-                await ws.send_text(json.dumps({"type": "lease", "granted": False,
-                                               "driver": "none"}))
-            elif kind == "mouse" and lease_token:   # local only; iframe handles its own
+            tab_id = msg.get("tab_id") or sub["tab"] or "t0"
+            if kind == "watch":
+                wt = msg.get("tab_id") or "t0"
+                watch(wt)
+                await push_initial(wt)
+            elif kind == "tabs":
+                enqueue({"type": "tabs", "tabs": session.list_tabs(),
+                         "leases": registry.lease_states(session_id)})
+            elif kind == "take_over":
+                lease = await registry.acquire(session_id, "human", user_id, tab_id=tab_id)
+                if lease:
+                    leases[tab_id] = lease.token
+                _send_lease(tab_id, lease is not None)
+            elif kind == "release" and leases.get(tab_id):
+                await registry.release(session_id, leases.pop(tab_id), tab_id=tab_id)
+                _send_lease(tab_id, False)
+            elif kind == "mouse" and leases.get(tab_id):   # local only; iframe self-handles
                 await session.inject_mouse(
-                    msg["x"], msg["y"], msg.get("event", "mousePressed")
+                    msg["x"], msg["y"], msg.get("event", "mousePressed"), tab_id=tab_id
                 )
-            elif kind == "key" and lease_token:
-                await session.inject_key(msg["key"], msg.get("text"))
+            elif kind == "key" and leases.get(tab_id):
+                await session.inject_key(msg["key"], msg.get("text"), tab_id=tab_id)
+            elif kind == "scroll" and leases.get(tab_id):
+                await session.inject_scroll(
+                    msg["x"], msg["y"], msg.get("dx", 0), msg.get("dy", 0), tab_id=tab_id
+                )
     except WebSocketDisconnect:
-        if session.live_view_mode == "screencast":
-            session.unsubscribe(send_frame)
-        if lease_token:
-            await registry.release(session_id, lease_token)
+        pass
+    finally:
+        if sub["fn"] is not None:
+            session.unsubscribe(sub["fn"], sub["tab"])
+        for tab_id, token in list(leases.items()):
+            await registry.release(session_id, token, tab_id=tab_id)
+        sender_task.cancel()
 
 
-# --- optionally serve the built frontend ------------------------------------
+# --- serve the built frontend (single-origin: no Vite/proxy in prod) ---------
+# app.frontend() registers the static build as LOW-priority routes, so all the
+# /api and /ws routes above are matched first; unknown browser paths fall back to
+# index.html (SPA routing). Build it with `cd frontend && npm run build`.
 _DIST = ROOT / "frontend" / "dist"
 if _DIST.is_dir():
-    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="frontend")
+    # fallback="auto": serve index.html for browser-navigation requests (SPA
+    # routing) but let unmatched /api/* fetches return a real 404, not HTML.
+    app.frontend("/", directory=str(_DIST), fallback="auto")

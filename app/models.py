@@ -15,12 +15,23 @@ class Risk(str, Enum):
 
 
 class ActionKind(str, Enum):
+    # DOM-ref based (act on elements by their ref id)
     NAVIGATE = "navigate"
     CLICK = "click"
     TYPE = "type"
     SELECT = "select"
     SCROLL = "scroll"
     EXTRACT = "extract"
+    # vision / coordinate based (act on pixels of the screenshot) + navigation,
+    # ported from the Computer-Use interface in computers/
+    CLICK_AT = "click_at"
+    TYPE_AT = "type_at"
+    SCROLL_AT = "scroll_at"
+    DRAG = "drag"
+    KEY = "key"
+    BACK = "back"
+    FORWARD = "forward"
+    WAIT = "wait"
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,15 +78,25 @@ class Action:
     text: str | None = None
     url: str | None = None
     submit: bool = False
+    # coordinate / vision params (pixel space of the screenshot)
+    x: float | None = None
+    y: float | None = None
+    x2: float | None = None
+    y2: float | None = None
+    keys: str | None = None          # e.g. "Enter" or "Control+A"
+    direction: str | None = None     # up|down|left|right for scrolls
+    magnitude: int | None = None
+    seconds: float | None = None
+    clear: bool = True               # type_at: clear the field before typing
 
     def to_json(self) -> dict:
-        return {
-            "kind": self.kind.value,
-            "risk": self.risk.value,
-            "ref": self.ref,
-            "text": self.text,
-            "url": self.url,
-        }
+        out: dict = {"kind": self.kind.value, "risk": self.risk.value}
+        for k in ("ref", "text", "url", "x", "y", "x2", "y2", "keys", "direction",
+                  "submit", "magnitude", "seconds", "clear"):
+            v = getattr(self, k)
+            if v is not None:
+                out[k] = v
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,9 +136,9 @@ class StepRecord:
 @dataclass(frozen=True, slots=True)
 class StreamEvent:
     type: Literal[
-        "token", "thinking", "tool_call", "tool_result", "action",
+        "token", "thinking", "tool_call", "action",
         "observation", "approval_request", "final", "error", "lease",
-        "live_view",
+        "live_view", "subagent_start", "subagent_end", "interrupted",
     ]
     chat_id: str
     data: Mapping[str, Any] = field(default_factory=dict)

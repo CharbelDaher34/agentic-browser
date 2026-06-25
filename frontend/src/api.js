@@ -47,6 +47,11 @@ export const api = {
     req('POST', '/api/chats', { session_id, title }),
   chatMessages: (cid) => req('GET', `/api/chats/${cid}/messages`),
   chatSteps: (cid) => req('GET', `/api/chats/${cid}/steps`),
+
+  // BYOK model keys
+  listKeys: () => req('GET', '/api/keys'),
+  saveKey: (provider, key) => req('PUT', `/api/keys/${provider}`, { key }),
+  deleteKey: (provider) => req('DELETE', `/api/keys/${provider}`),
 }
 
 // Build a same-origin WebSocket URL (works through the Vite proxy and in prod).

@@ -5,12 +5,20 @@ live chat UI, a watch‑along browser view, and human‑in‑the‑loop approval
 risky actions.
 
 - **Backend** — FastAPI + **PydanticAI v2** + Playwright
-- **Persistence** — Postgres (users, login sessions, browser sessions, chats,
-  message history, recorded steps + screenshots)
+- **Hybrid acting** — the agent acts two ways: **DOM mode** (elements by `ref`)
+  *and* **vision mode** (it `screenshot`s the page and clicks by **pixel
+  coordinates** — `click_at` / `type_at` / `scroll` / `drag`). Coordinates handle
+  canvas, maps, and visual widgets the DOM listing misses. (Action vocabulary +
+  stealth adapted from the Computer‑Use reference in `computers/`.)
+- **Persistence** — Postgres via **SQLModel** (users, login sessions, browser
+  sessions, chats, message history, recorded steps + screenshots)
 - **Multi‑user** — accounts with login tokens; every browser session and chat is
   scoped to its owner
-- **Streaming** — model tokens, thinking, tool calls, and browser steps stream
-  live over WebSockets
+- **Ordered streaming** — model tokens, thinking, tool calls, and browser steps
+  stream live over WebSockets through a single‑writer queue, so events arrive in
+  exact order (the agent's tools run in a separate task from the event consumer)
+- **Stealth** — anti‑automation hardening (realistic UA/locale/timezone,
+  `navigator.webdriver` masking, launch flags) + single‑tab popup handling
 - **Live view + takeover** — watch the agent's browser (screencast) and grab
   control at any time; a single‑driver *lease* pauses the agent while you drive
 - **Approval gate** — destructive actions (pay/delete/send/…) pause and wait for
@@ -25,13 +33,13 @@ risky actions.
 app/
   config.py     env/.env settings (DB url, provider, model, …)
   models.py     value types + StepRecord + StreamEvent
-  providers.py  local Playwright vs Browserbase, behind one interface
-  session.py    PlaywrightSession: perceive, act/verify, screencast, input inject
-  store.py      Postgres: users, auth tokens, sessions, chats, messages, steps
+  providers.py  local Playwright (stealth) vs Browserbase, behind one interface
+  session.py    PlaywrightSession: perceive, DOM + coordinate act/verify, screencast
+  store.py      SQLModel models + async queries (users, sessions, chats, messages, steps)
   auth.py       pbkdf2 password hashing + bearer login tokens + FastAPI deps
   recorder.py   per-step screenshot artifact + DB row (replay trail)
   registry.py   long-lived browser sessions + single-driver control lease
-  agent.py      PydanticAI v2 agent + tools (record + emit + approval gate)
+  agent.py      PydanticAI v2 hybrid agent: DOM-ref + vision/coordinate tools
   runner.py     run_stream_events loop: tokens + steps + approvals + persist
   gateway.py    FastAPI: REST + chat WS + view/takeover WS + static serving
   evals.py      pydantic_evals dataset + success evaluators
