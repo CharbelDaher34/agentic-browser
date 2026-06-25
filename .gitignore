@@ -1,0 +1,16 @@
+.venv
+.env
+
+# python
+__pycache__/
+*.pyc
+
+# runtime artifacts (screenshots / replay trail)
+artifacts/
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+
+# uv
+.python-version
