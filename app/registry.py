@@ -57,15 +57,31 @@ class SessionRegistry:
         async with self._create_lock:
             if session_id in self._sessions:
                 return session_id
-            provider = make_provider(provider_name)
+            # per-session BYOK: browserbase creds come from the session's own keys
+            # (or the server env fallback for a local dev). make_provider raises at
+            # open() if neither is present.
+            prov = provider_name or settings().browser_provider
+            bb_creds = (
+                await self._store.load_session_browserbase_creds(session_id)
+                if prov == "browserbase" else None
+            )
+            provider = make_provider(prov, browserbase_creds=bb_creds)
             prior = await self._store.load_storage_state(session_id)
-            session = await PlaywrightSession.open(provider, storage_state=prior)
-            # restore the last page so the browser comes back where it stopped
-            # (cookies/localStorage are already restored via storage_state).
-            last_url = await self._store.load_last_url(session_id)
-            if last_url and last_url.startswith(("http://", "https://")):
-                await session.goto(last_url)
+            # reconnect to a still-live browserbase session if we have its id
+            prior_bb = await self._store.load_bb_session_id(session_id)
+            session = await PlaywrightSession.open(
+                provider, storage_state=prior, reconnect_id=prior_bb
+            )
+            # Only a FRESH session needs the last page restored; a reconnected live
+            # session is already on its current page (don't navigate it away).
+            reconnected = bool(prior_bb and session.provider_session_id == prior_bb)
+            if not reconnected:
+                last_url = await self._store.load_last_url(session_id)
+                if last_url and last_url.startswith(("http://", "https://")):
+                    await session.goto(last_url)
             await self._store.upsert_session(session_id, provider.name)
+            # persist the (possibly new) browserbase id so any replica can reconnect
+            await self._store.save_bb_session_id(session_id, session.provider_session_id)
             self._sessions[session_id] = _Entry(
                 session=session, provider=provider.name
             )
@@ -177,11 +193,20 @@ class SessionRegistry:
             # (a turn in flight / human takeover holds a tab lease).
             any_driven = any(l.driver != "none" for l in e.leases.values())
             if not e.chats and not any_driven and now - e.last_used > ttl:
+                # Reaping = genuine session end (unlike shutdown, which is just an
+                # instance recycle). Fully tear down: release the remote browser
+                # (browserbase REQUEST_RELEASE) and PURGE the session's BYOK keys,
+                # so we don't retain users' keys (or pay for idle cloud browsers).
                 try:
                     await self._store.save_storage_state(
                         sid, await e.session.storage_state(), last_url=e.session.url
                     )
-                    await e.session.close()
+                    await e.session.release()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await self._store.delete_session_keys(sid)
+                    await self._store.save_bb_session_id(sid, None)
                 except Exception:  # noqa: BLE001
                     pass
                 del self._sessions[sid]

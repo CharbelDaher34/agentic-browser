@@ -54,9 +54,24 @@ from .runner import Runner
 from .store import Store
 
 
+async def _bootstrap_user(store: Store) -> None:
+    """Create the single bootstrapped account on startup (idempotent). Combined
+    with allow_registration=False, this is how a public deploy is locked to one
+    login: the password lives only in env (BOOTSTRAP_PASSWORD), never in code."""
+    s = settings()
+    if not (s.bootstrap_username and s.bootstrap_password):
+        return
+    if await store.get_user_by_username(s.bootstrap_username):
+        return
+    await store.create_user(
+        new_user_id(), s.bootstrap_username, hash_password(s.bootstrap_password)
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store = await Store.connect(settings().database_url)
+    await _bootstrap_user(store)
     registry = SessionRegistry(store)
     recorder = Recorder(store, LocalArtifacts(settings().artifacts_dir))
     runner = Runner(registry, store, recorder)
@@ -103,9 +118,19 @@ class ApiKeyIn(BaseModel):
     key: str
 
 
+class BrowserbaseCreds(BaseModel):
+    api_key: str
+    project_id: str
+
+
 class CreateSession(BaseModel):
     name: str | None = None
     provider: ProviderName | None = None
+    # per-session BYOK: provided by web users at creation. browserbase is required
+    # to open a cloud browser (unless the server env supplies a fallback); the LLM
+    # keys are optional (fall back to the server env).
+    browserbase: BrowserbaseCreds | None = None
+    keys: dict[str, str] | None = None   # {anthropic|openai|google: api_key}
 
 
 class CreateChat(BaseModel):
@@ -114,8 +139,16 @@ class CreateChat(BaseModel):
 
 
 # --- auth --------------------------------------------------------------------
+@app.get("/api/auth/config")
+async def auth_config():
+    # public: lets the UI hide the sign-up form when registration is disabled
+    return {"allow_registration": settings().allow_registration}
+
+
 @app.post("/api/auth/register")
 async def register(body: Credentials):
+    if not settings().allow_registration:
+        raise HTTPException(403, "Registration is disabled")
     store: Store = app.state.store
     if not body.username.strip() or len(body.password) < 4:
         raise HTTPException(400, "Username required and password must be >= 4 chars")
@@ -158,32 +191,87 @@ async def logout(
     return {"ok": True}
 
 
-# --- BYOK: per-user model API keys ------------------------------------------
-# Supported providers come from the model registry (single source of truth).
+# --- app config (public-ish: tells the UI what to ask for) -------------------
+def _server_browserbase() -> bool:
+    """True if the server has a usable Browserbase fallback (off under enforce_byok)."""
+    s = settings()
+    return bool(s.browserbase_api_key and s.browserbase_project_id) and not s.enforce_byok
 
 
-@app.get("/api/keys")
-async def list_keys(user: dict = Depends(current_user)):
+@app.get("/api/config")
+async def app_config():
+    s = settings()
+    return {
+        "browser_provider": s.browser_provider,
+        # web users must supply Browserbase creds at session creation unless the
+        # server provides a fallback (a developer running locally with env keys).
+        "browserbase_required": s.browser_provider == "browserbase" and not _server_browserbase(),
+        # when true, server LLM keys are disabled too, so model keys are required
+        "enforce_byok": s.enforce_byok,
+        "key_providers": sorted(KEY_PROVIDERS),
+    }
+
+
+# --- BYOK: per-SESSION keys (purged when the session is reaped) --------------
+async def _own_session_or_404(session_id: str, user_id: str) -> Store:
     store: Store = app.state.store
-    have = set(await store.list_key_providers(user["user_id"]))
-    # report which providers the user has set (never return the keys themselves)
-    return {"providers": {p: (p in have) for p in sorted(KEY_PROVIDERS)}}
+    if await store.session_owner(session_id) != user_id:
+        raise HTTPException(404, "Session not found")
+    return store
 
 
-@app.put("/api/keys/{provider}")
-async def set_key(provider: str, body: ApiKeyIn, user: dict = Depends(current_user)):
+@app.get("/api/sessions/{session_id}/keys")
+async def list_session_keys(session_id: str, user: dict = Depends(current_user)):
+    store = await _own_session_or_404(session_id, user["user_id"])
+    have = set(await store.list_session_key_providers(session_id))
+    # report which providers are set (never return the keys themselves)
+    return {
+        "providers": {p: (p in have) for p in sorted(KEY_PROVIDERS)},
+        "browserbase": "browserbase" in have,
+    }
+
+
+@app.put("/api/sessions/{session_id}/keys/{provider}")
+async def set_session_key(
+    session_id: str, provider: str, body: ApiKeyIn, user: dict = Depends(current_user)
+):
     if provider not in KEY_PROVIDERS:
         raise HTTPException(400, "Unknown provider")
+    store = await _own_session_or_404(session_id, user["user_id"])
     key = (body.key or "").strip()
     if not key:
         raise HTTPException(400, "Empty key")
-    await app.state.store.save_api_key(user["user_id"], provider, key)
+    await store.save_session_key(session_id, provider, key)
     return {"ok": True}
 
 
-@app.delete("/api/keys/{provider}")
-async def delete_key(provider: str, user: dict = Depends(current_user)):
-    await app.state.store.delete_api_key(user["user_id"], provider)
+@app.delete("/api/sessions/{session_id}/keys/{provider}")
+async def delete_session_key(
+    session_id: str, provider: str, user: dict = Depends(current_user)
+):
+    store = await _own_session_or_404(session_id, user["user_id"])
+    await store.delete_session_key(session_id, provider)
+    return {"ok": True}
+
+
+@app.put("/api/sessions/{session_id}/browserbase")
+async def set_session_browserbase(
+    session_id: str, body: BrowserbaseCreds, user: dict = Depends(current_user)
+):
+    store = await _own_session_or_404(session_id, user["user_id"])
+    api_key, project_id = body.api_key.strip(), body.project_id.strip()
+    if not (api_key and project_id):
+        raise HTTPException(400, "Both API key and project ID are required")
+    await store.save_session_browserbase_creds(session_id, api_key, project_id)
+    return {"ok": True}
+
+
+@app.delete("/api/sessions/{session_id}/browserbase")
+async def delete_session_browserbase(
+    session_id: str, user: dict = Depends(current_user)
+):
+    store = await _own_session_or_404(session_id, user["user_id"])
+    await store.delete_session_key(session_id, "browserbase")
     return {"ok": True}
 
 
@@ -192,13 +280,35 @@ async def delete_key(provider: str, user: dict = Depends(current_user)):
 async def create_session(body: CreateSession, user: dict = Depends(current_user)):
     store: Store = app.state.store
     registry: SessionRegistry = app.state.registry
-    provider = body.provider or settings().browser_provider
+    s = settings()
+    provider = body.provider or s.browser_provider
+    # browserbase needs creds up front (session-supplied, else a server fallback)
+    if provider == "browserbase":
+        if not body.browserbase and not _server_browserbase():
+            raise HTTPException(
+                400, "Add your Browserbase API key and project ID to open a cloud browser."
+            )
+
     session_id = "s_" + uuid.uuid4().hex[:12]
     name = body.name or f"session-{session_id[2:8]}"
     await store.create_session(session_id, user["user_id"], name, provider)
+    # stash this session's BYOK keys BEFORE opening the browser
+    if body.browserbase:
+        await store.save_session_browserbase_creds(
+            session_id, body.browserbase.api_key.strip(), body.browserbase.project_id.strip()
+        )
+    for prov, key in (body.keys or {}).items():
+        if prov in KEY_PROVIDERS and (key or "").strip():
+            await store.save_session_key(session_id, prov, key.strip())
+
     try:
         await registry.create(session_id, provider)  # opens the browser now
     except Exception as exc:  # noqa: BLE001
+        # don't retain keys for a session that never opened
+        await store.delete_session_keys(session_id)
+        msg = str(exc)
+        if "Browserbase credentials" in msg:
+            raise HTTPException(400, msg)
         raise HTTPException(
             500,
             f"Browser failed to start ({exc}). If local: run "

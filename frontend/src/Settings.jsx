@@ -7,15 +7,24 @@ const PROVIDERS = [
   { id: 'google', label: 'Google (Gemini)', hint: 'AIza…' },
 ]
 
-// BYOK settings: add/replace/remove a model API key per provider. Keys are
-// stored encrypted server-side; we only ever learn whether one is set.
-export default function Settings({ onClose }) {
+// Per-session BYOK settings: add/replace/remove keys for ONE browser session.
+// Keys are stored encrypted server-side and purged when the session is reaped;
+// we only ever learn whether one is set.
+export default function Settings({ sessionId, enforceByok, onClose }) {
   const [have, setHave] = useState({})
+  const [bbSet, setBbSet] = useState(false)
   const [drafts, setDrafts] = useState({})
+  const [bbKey, setBbKey] = useState('')
+  const [bbProject, setBbProject] = useState('')
   const [busy, setBusy] = useState('')
 
-  const refresh = () => api.listKeys().then((r) => setHave(r.providers || {})).catch(() => {})
-  useEffect(() => { refresh() }, [])
+  const refresh = () => {
+    if (!sessionId) return
+    api.sessionKeys(sessionId)
+      .then((r) => { setHave(r.providers || {}); setBbSet(!!r.browserbase) })
+      .catch(() => {})
+  }
+  useEffect(refresh, [sessionId])
   useEffect(() => {
     const onKey = (e) => e.key === 'Escape' && onClose()
     window.addEventListener('keydown', onKey)
@@ -26,12 +35,24 @@ export default function Settings({ onClose }) {
     const key = (drafts[p] || '').trim()
     if (!key) return
     setBusy(p)
-    try { await api.saveKey(p, key); setDrafts((d) => ({ ...d, [p]: '' })); await refresh() }
+    try { await api.saveSessionKey(sessionId, p, key); setDrafts((d) => ({ ...d, [p]: '' })); refresh() }
     finally { setBusy('') }
   }
   const remove = async (p) => {
     setBusy(p)
-    try { await api.deleteKey(p); await refresh() } finally { setBusy('') }
+    try { await api.deleteSessionKey(sessionId, p); refresh() } finally { setBusy('') }
+  }
+  const saveBb = async () => {
+    if (!(bbKey.trim() && bbProject.trim())) return
+    setBusy('browserbase')
+    try {
+      await api.saveSessionBrowserbase(sessionId, bbKey.trim(), bbProject.trim())
+      setBbKey(''); setBbProject(''); refresh()
+    } finally { setBusy('') }
+  }
+  const removeBb = async () => {
+    setBusy('browserbase')
+    try { await api.deleteSessionBrowserbase(sessionId); refresh() } finally { setBusy('') }
   }
 
   return (
@@ -40,36 +61,60 @@ export default function Settings({ onClose }) {
         <div className="modal-head">
           <div className="warn-ic" style={{ background: 'var(--accent-soft)', color: 'var(--accent)' }}>🔑</div>
           <div>
-            <div style={{ fontWeight: 700 }}>Model API keys</div>
+            <div style={{ fontWeight: 700 }}>Session keys</div>
             <div className="faint" style={{ fontSize: 12 }}>
-              Optional — your own keys are used when set, otherwise the server's.
+              Keys for this session only — deleted when it's reaped.
             </div>
           </div>
         </div>
         <div className="modal-body">
-          {PROVIDERS.map((p) => (
-            <div className="key-row" key={p.id}>
-              <div className="key-row-h">
-                <span className="key-label">{p.label}</span>
-                {have[p.id]
-                  ? <span className="key-set">● set</span>
-                  : <span className="faint" style={{ fontSize: 11 }}>using server key</span>}
+          {!sessionId ? (
+            <div className="faint" style={{ fontSize: 13 }}>Open a chat to manage its session's keys.</div>
+          ) : (
+            <>
+              <div className="key-row">
+                <div className="key-row-h">
+                  <span className="key-label">Browserbase</span>
+                  {bbSet
+                    ? <span className="key-set">● set</span>
+                    : <span className="faint" style={{ fontSize: 11 }}>not set</span>}
+                </div>
+                <input className="input" type="password" placeholder="Browserbase API key (bb_live_…)"
+                  value={bbKey} onChange={(e) => setBbKey(e.target.value)} style={{ marginBottom: 6 }} />
+                <div className="row">
+                  <input className="input grow" placeholder="Browserbase project ID"
+                    value={bbProject} onChange={(e) => setBbProject(e.target.value)} />
+                  <button className="btn primary mini" disabled={busy === 'browserbase' || !(bbKey.trim() && bbProject.trim())}
+                    onClick={saveBb}>Save</button>
+                  {bbSet && (
+                    <button className="btn ghost mini" disabled={busy === 'browserbase'} onClick={removeBb}>Remove</button>
+                  )}
+                </div>
               </div>
-              <div className="row">
-                <input
-                  className="input grow" type="password" placeholder={p.hint}
-                  value={drafts[p.id] || ''}
-                  onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
-                  onKeyDown={(e) => e.key === 'Enter' && save(p.id)}
-                />
-                <button className="btn primary mini" disabled={busy === p.id || !(drafts[p.id] || '').trim()}
-                  onClick={() => save(p.id)}>Save</button>
-                {have[p.id] && (
-                  <button className="btn ghost mini" disabled={busy === p.id} onClick={() => remove(p.id)}>Remove</button>
-                )}
-              </div>
-            </div>
-          ))}
+
+              {PROVIDERS.map((p) => (
+                <div className="key-row" key={p.id}>
+                  <div className="key-row-h">
+                    <span className="key-label">{p.label}</span>
+                    {have[p.id]
+                      ? <span className="key-set">● set</span>
+                      : <span className="faint" style={{ fontSize: 11 }}>{enforceByok ? 'required' : 'using server key'}</span>}
+                  </div>
+                  <div className="row">
+                    <input className="input grow" type="password" placeholder={p.hint}
+                      value={drafts[p.id] || ''}
+                      onChange={(e) => setDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                      onKeyDown={(e) => e.key === 'Enter' && save(p.id)} />
+                    <button className="btn primary mini" disabled={busy === p.id || !(drafts[p.id] || '').trim()}
+                      onClick={() => save(p.id)}>Save</button>
+                    {have[p.id] && (
+                      <button className="btn ghost mini" disabled={busy === p.id} onClick={() => remove(p.id)}>Remove</button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
         </div>
         <div className="modal-foot">
           <button className="btn ghost" onClick={onClose}>Done</button>

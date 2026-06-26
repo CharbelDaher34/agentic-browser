@@ -35,7 +35,7 @@ from .agent import AgentDeps, agent
 from .config import settings
 from .history import well_formed
 from .models import StreamEvent
-from .models_registry import build_model
+from .models_registry import build_model, pick_model
 from .recorder import Recorder
 from .registry import SessionRegistry
 from .store import Store
@@ -149,16 +149,18 @@ class Runner:
             # continue the per-chat step counter rather than resetting to 0,
             # so step idx stays monotonic across turns (correct replay trail).
             start_idx = await self.store.max_step_idx(chat_id)
-            # BYOK: the user's keys (decrypted) override the server keys per provider.
+            # BYOK: this session's keys (decrypted) override the server keys per
+            # provider. Keys are per-session and purged when the session is reaped.
             try:
-                user_keys = await self.store.load_user_keys(user_id) if user_id else {}
+                user_keys = await self.store.load_session_keys(session_id)
             except Exception:  # noqa: BLE001 — never block a turn on key loading
                 user_keys = {}
             deps = AgentDeps(
                 session_id, chat_id, lease.token, self.registry, self.recorder,
                 emit, _idx=[start_idx], user_keys=user_keys,
             )
-            orch_model = build_model(settings().agent_model, user_keys)
+            # orchestrator runs on whichever provider this session has a key for
+            orch_model = build_model(pick_model("smart", user_keys), user_keys)
             # Heal any history saved with a dangling tool_use (e.g. a turn that was
             # interrupted while a tool call / approval was pending) so Anthropic
             # doesn't reject it; also re-persists the cleaned history at turn end.

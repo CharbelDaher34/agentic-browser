@@ -45,10 +45,19 @@ export function AuthProvider({ children }) {
 export function AuthScreen() {
   const { setUser } = useAuth()
   const [mode, setMode] = useState('login')
+  const [canRegister, setCanRegister] = useState(false)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
+
+  // Hide the sign-up form unless the backend allows registration (a locked-down
+  // deploy is login-only). Defaults to false so signup never flashes.
+  useEffect(() => {
+    api.authConfig()
+      .then((c) => setCanRegister(!!c.allow_registration))
+      .catch(() => setCanRegister(false))
+  }, [])
 
   const submit = async (e) => {
     e.preventDefault()
@@ -95,13 +104,15 @@ export function AuthScreen() {
           disabled={busy || !username || !password}>
           {busy ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
         </button>
-        <div className="auth-switch">
-          {mode === 'login' ? (
-            <>New here? <a onClick={() => { setMode('register'); setErr('') }}>Create an account</a></>
-          ) : (
-            <>Have an account? <a onClick={() => { setMode('login'); setErr('') }}>Sign in</a></>
-          )}
-        </div>
+        {canRegister && (
+          <div className="auth-switch">
+            {mode === 'login' ? (
+              <>New here? <a onClick={() => { setMode('register'); setErr('') }}>Create an account</a></>
+            ) : (
+              <>Have an account? <a onClick={() => { setMode('login'); setErr('') }}>Sign in</a></>
+            )}
+          </div>
+        )}
       </form>
     </div>
   )

@@ -121,6 +121,11 @@ class PlaywrightSession:
         return self._ob.live_view_url
 
     @property
+    def provider_session_id(self) -> str | None:
+        """browserbase session id (for persist + reconnect); None for local."""
+        return self._ob.provider_session_id
+
+    @property
     def _page(self):
         """Primary page — compat shim for callers that reach in directly."""
         return self._tab(None).page
@@ -148,8 +153,10 @@ class PlaywrightSession:
         return self.url_of(None)
 
     @classmethod
-    async def open(cls, provider, storage_state: dict | None = None) -> "PlaywrightSession":
-        self = cls(await provider.open(storage_state))
+    async def open(
+        cls, provider, storage_state: dict | None = None, *, reconnect_id: str | None = None
+    ) -> "PlaywrightSession":
+        self = cls(await provider.open(storage_state, reconnect_id=reconnect_id))
         t0 = _Tab(self._primary, self._ob.page, self._ob.cdp, label="main")
         self._tabs[self._primary] = t0
         # New tabs/popups are ADOPTED as real tabs (multi-tab model). Listening at
@@ -479,6 +486,19 @@ class PlaywrightSession:
             )
 
     async def close(self) -> None:
+        # Detach our connection; for browserbase the keep-alive session stays warm
+        # server-side so a later ensure()/replica can reconnect by id.
         for tab in self._tabs.values():
             tab.streaming = False
         await self._ob.close()
+
+    async def release(self) -> None:
+        """Destroy the underlying browser session for good (browserbase
+        REQUEST_RELEASE). For an explicit session-delete / cost-cap path — not the
+        normal idle reap, which only detaches via close()."""
+        for tab in self._tabs.values():
+            tab.streaming = False
+        if self._ob.release is not None:
+            await self._ob.release()
+        else:
+            await self._ob.close()

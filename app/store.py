@@ -16,6 +16,8 @@ unchanged from the asyncpg version, so the rest of the app is untouched.
 
 from __future__ import annotations
 
+import json
+import ssl
 from datetime import datetime
 from typing import Optional
 
@@ -38,6 +40,10 @@ from .models import StepRecord
 # raise "Table already defined" against SQLModel's shared metadata.
 _TA = {"extend_existing": True}
 
+# Browserbase BYOK creds (api_key + project_id) ride in the same session_api_keys
+# table as the model keys, under this pseudo-provider, as an encrypted JSON blob.
+_BROWSERBASE_PROVIDER = "browserbase"
+
 
 def _ts_col() -> sa.Column:
     return sa.Column(sa.DateTime(timezone=True), server_default=sa.func.now())
@@ -52,12 +58,15 @@ class User(SQLModel, table=True):
     created_at: Optional[datetime] = Field(default=None, sa_column=_ts_col())
 
 
-class UserApiKey(SQLModel, table=True):
-    """A user's BYOK model key (encrypted at rest), one row per provider."""
-    __tablename__ = "user_api_keys"
+class SessionApiKey(SQLModel, table=True):
+    """BYOK keys scoped to a browser session (encrypted at rest), one row per
+    provider. Web users bring their own keys per session; the rows are purged
+    when the session is reaped (ON DELETE CASCADE covers an explicit session
+    delete; reap_idle deletes them explicitly since reaping keeps the row)."""
+    __tablename__ = "session_api_keys"
     __table_args__ = _TA
-    user_id: str = Field(primary_key=True, foreign_key="users.user_id", ondelete="CASCADE")
-    provider: str = Field(primary_key=True)   # "anthropic" | "openai" | "google"
+    session_id: str = Field(primary_key=True, foreign_key="sessions.session_id", ondelete="CASCADE")
+    provider: str = Field(primary_key=True)   # anthropic | openai | google | browserbase
     encrypted_key: str
     created_at: Optional[datetime] = Field(default=None, sa_column=_ts_col())
 
@@ -81,6 +90,9 @@ class BrowserSession(SQLModel, table=True):
     provider: str
     storage_state: Optional[dict] = Field(default=None, sa_column=sa.Column(JSONB))
     last_url: Optional[str] = None   # primary tab's URL, restored on rehydrate
+    # browserbase session id — lets any replica/restart reconnect to the same live
+    # browser instead of orphaning it (see registry.create / BrowserbaseProvider).
+    bb_session_id: Optional[str] = Field(default=None, index=True)
     created_at: Optional[datetime] = Field(default=None, sa_column=_ts_col())
     updated_at: Optional[datetime] = Field(default=None, sa_column=_ts_col())
 
@@ -159,13 +171,23 @@ class Store:
             dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
         elif dsn.startswith("postgres://"):
             dsn = dsn.replace("postgres://", "postgresql+asyncpg://", 1)
-        engine = create_async_engine(dsn, pool_pre_ping=True)
+        # asyncpg caches prepared statements per connection; Supabase/pgbouncer
+        # poolers reuse backends, which breaks cached plans — disable the cache.
+        connect_args: dict = {"statement_cache_size": 0}
+        # Managed Postgres (Supabase etc.) requires TLS; attach an SSL context for
+        # remote hosts but skip it for the local docker-compose Postgres.
+        if not any(h in dsn for h in ("@localhost", "@127.0.0.1")):
+            connect_args["ssl"] = ssl.create_default_context()
+        engine = create_async_engine(dsn, pool_pre_ping=True, connect_args=connect_args)
         async with engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.create_all)
             # create_all won't add columns to a table that already exists, so add
             # newer columns explicitly (no-op if already present).
             await conn.execute(
                 sa.text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_url TEXT")
+            )
+            await conn.execute(
+                sa.text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS bb_session_id TEXT")
             )
         return cls(engine)
 
@@ -191,26 +213,28 @@ class Store:
             u = (await s.execute(select(User).where(User.user_id == user_id))).scalars().first()
         return {"user_id": u.user_id, "username": u.username} if u else None
 
-    # ---- per-user API keys (BYOK, encrypted at rest) -----------------------
-    async def save_api_key(self, user_id: str, provider: str, plaintext: str) -> None:
+    # ---- per-SESSION BYOK keys (encrypted at rest; purged when session reaped) ---
+    async def save_session_key(self, session_id: str, provider: str, plaintext: str) -> None:
         enc = encrypt(plaintext)
         async with self._sm() as s:
             await s.execute(
-                pg_insert(UserApiKey)
-                .values(user_id=user_id, provider=provider, encrypted_key=enc)
+                pg_insert(SessionApiKey)
+                .values(session_id=session_id, provider=provider, encrypted_key=enc)
                 .on_conflict_do_update(
-                    index_elements=["user_id", "provider"], set_={"encrypted_key": enc}
+                    index_elements=["session_id", "provider"], set_={"encrypted_key": enc}
                 )
             )
             await s.commit()
 
-    async def load_user_keys(self, user_id: str) -> dict[str, str]:
-        """Decrypted {provider: api_key} for a user (skips any that fail to decrypt)."""
+    async def load_session_keys(self, session_id: str) -> dict[str, str]:
+        """Decrypted {provider: api_key} of a session's MODEL keys (excludes the
+        2-field browserbase blob; skips any that fail to decrypt)."""
         async with self._sm() as s:
             rows = (
                 await s.execute(
-                    select(UserApiKey.provider, UserApiKey.encrypted_key).where(
-                        UserApiKey.user_id == user_id
+                    select(SessionApiKey.provider, SessionApiKey.encrypted_key).where(
+                        SessionApiKey.session_id == session_id,
+                        SessionApiKey.provider != _BROWSERBASE_PROVIDER,
                     )
                 )
             ).all()
@@ -221,23 +245,66 @@ class Store:
                 out[provider] = pt
         return out
 
-    async def delete_api_key(self, user_id: str, provider: str) -> None:
+    async def delete_session_key(self, session_id: str, provider: str) -> None:
         async with self._sm() as s:
             await s.execute(
-                sa.delete(UserApiKey).where(
-                    UserApiKey.user_id == user_id, UserApiKey.provider == provider
+                sa.delete(SessionApiKey).where(
+                    SessionApiKey.session_id == session_id,
+                    SessionApiKey.provider == provider,
                 )
             )
             await s.commit()
 
-    async def list_key_providers(self, user_id: str) -> list[str]:
+    async def delete_session_keys(self, session_id: str) -> None:
+        """Purge ALL of a session's keys (called when the session is reaped)."""
+        async with self._sm() as s:
+            await s.execute(
+                sa.delete(SessionApiKey).where(SessionApiKey.session_id == session_id)
+            )
+            await s.commit()
+
+    async def list_session_key_providers(self, session_id: str) -> list[str]:
         async with self._sm() as s:
             rows = (
                 await s.execute(
-                    select(UserApiKey.provider).where(UserApiKey.user_id == user_id)
+                    select(SessionApiKey.provider).where(
+                        SessionApiKey.session_id == session_id
+                    )
                 )
             ).scalars().all()
         return list(rows)
+
+    async def save_session_browserbase_creds(
+        self, session_id: str, api_key: str, project_id: str
+    ) -> None:
+        await self.save_session_key(
+            session_id, _BROWSERBASE_PROVIDER,
+            json.dumps({"api_key": api_key, "project_id": project_id}),
+        )
+
+    async def load_session_browserbase_creds(self, session_id: str) -> dict | None:
+        """{'api_key','project_id'} for a session, or None if unset/undecryptable."""
+        async with self._sm() as s:
+            enc = (
+                await s.execute(
+                    select(SessionApiKey.encrypted_key).where(
+                        SessionApiKey.session_id == session_id,
+                        SessionApiKey.provider == _BROWSERBASE_PROVIDER,
+                    )
+                )
+            ).scalars().first()
+        if not enc:
+            return None
+        pt = decrypt(enc)
+        if not pt:
+            return None
+        try:
+            d = json.loads(pt)
+        except Exception:  # noqa: BLE001
+            return None
+        if d.get("api_key") and d.get("project_id"):
+            return {"api_key": d["api_key"], "project_id": d["project_id"]}
+        return None
 
     # ---- auth sessions (login tokens) --------------------------------------
     async def create_token(self, token: str, user_id: str, expires_at: datetime) -> None:
@@ -293,6 +360,7 @@ class Store:
         return {
             "session_id": r.session_id, "user_id": r.user_id, "name": r.name,
             "provider": r.provider, "created_at": r.created_at, "updated_at": r.updated_at,
+            "bb_session_id": r.bb_session_id,
         }
 
     async def list_sessions(self, user_id: str) -> list[dict]:
@@ -361,6 +429,26 @@ class Store:
             r = (
                 await s.execute(
                     select(BrowserSession.last_url).where(
+                        BrowserSession.session_id == session_id
+                    )
+                )
+            ).scalars().first()
+        return r or None
+
+    async def save_bb_session_id(self, session_id: str, bb_session_id: str | None) -> None:
+        async with self._sm() as s:
+            await s.execute(
+                sa.update(BrowserSession)
+                .where(BrowserSession.session_id == session_id)
+                .values(bb_session_id=bb_session_id)
+            )
+            await s.commit()
+
+    async def load_bb_session_id(self, session_id: str) -> str | None:
+        async with self._sm() as s:
+            r = (
+                await s.execute(
+                    select(BrowserSession.bb_session_id).where(
                         BrowserSession.session_id == session_id
                     )
                 )

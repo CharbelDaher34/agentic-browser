@@ -49,7 +49,7 @@ from .models_registry import (
     alias_choices,
     build_model,
     build_vision_model,
-    resolve,
+    pick_model,
 )
 from .recorder import Recorder
 from .registry import SessionRegistry
@@ -308,7 +308,7 @@ class _Point(BaseModel):
 
 
 _locator = Agent(
-    settings().agent_model,  # placeholder; every call overrides with build_vision_model()
+    None,  # model deferred; every call overrides with model=build_vision_model()
     output_type=_Point,
     system_prompt=(
         "You are a precise UI visual-grounding model. Given a screenshot and a "
@@ -393,7 +393,7 @@ SUBAGENT_PROMPT = (
 )
 
 subagent = Agent(
-    settings().agent_model,
+    None,  # model deferred; _run_subtask passes model=build_model(...) per run
     deps_type=AgentDeps,
     output_type=str,
     tools=_BROWSING_TOOLS,
@@ -418,7 +418,7 @@ ORCHESTRATOR_PROMPT = (
 )
 
 agent = Agent(
-    settings().agent_model,
+    None,  # model deferred; run_turn passes model=build_model(agent_model, keys) per run
     deps_type=AgentDeps,
     output_type=[str, DeferredToolRequests],
     tools=_ORCHESTRATOR_TOOLS,
@@ -460,7 +460,7 @@ async def _run_subtask(ctx: RunContext[AgentDeps], t: SubTask) -> dict:
         }))
         r = await subagent.run(
             t.task, deps=sub_deps,
-            model=build_model(resolve(t.model_alias), ctx.deps.user_keys),
+            model=build_model(pick_model(t.model_alias, ctx.deps.user_keys), ctx.deps.user_keys),
             usage=ctx.usage,
         )
         await d.emit(StreamEvent("subagent_end", d.chat_id, {

@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "asyncpg>=0.31.0",
-    "fastapi>=0.138.0",
+    "browserbase>=1.4.0",
+    "fastapi[standard]>=0.138.0",
     "playwright>=1.60.0",
     "pydantic-ai-slim[anthropic,google,openai]==2.0.0",
     "pydantic-evals>=2.0.0",
@@ -16,3 +17,8 @@ dependencies = [
     "uvicorn[standard]>=0.49.0",
     "websockets>=16.0",
 ]
+
+# Entrypoint for FastAPI Cloud / the `fastapi` CLI — the real app lives in
+# app/gateway.py and is re-exported by main.py (see that file).
+[tool.fastapi]
+entrypoint = "main:app"

@@ -35,7 +35,12 @@ class Settings(BaseSettings):
     agent_model: str = "anthropic:claude-sonnet-4-6"
     headless: bool = True
     artifacts_dir: str = str(ROOT / "artifacts")
-    token_ttl_hours: int = 720  # 30 days
+    token_ttl_hours: int = 1  # 30 days
+    # access control: lock a public deploy to a single account. Registration is
+    # OFF by default; the bootstrap user (if set) is created on startup.
+    allow_registration: bool = False
+    bootstrap_username: str | None = None
+    bootstrap_password: str | None = None
     # NoDecode: keep pydantic-settings from JSON-parsing the env value so the
     # `_split_csv` validator below can accept a plain comma-separated string.
     cors_origins: Annotated[list[str], NoDecode] = [
@@ -48,10 +53,17 @@ class Settings(BaseSettings):
     max_concurrent_subagents: int = 1
     max_tabs: int = 6
 
-    # server-side provider API keys (BYOK falls back to these)
+    # server-side provider API keys (BYOK falls back to these). On a public deploy
+    # these are left unset so every user must bring their own (Browserbase too).
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
     gemini_api_key: str | None = None
+    browserbase_api_key: str | None = None
+    browserbase_project_id: str | None = None
+    # Enforce BYOK: when true, the server keys above are NEVER used as a fallback —
+    # every model call AND Browserbase session must use the user's own per-session
+    # keys. Set this on a public deploy so a forgotten server key is never served.
+    enforce_byok: bool = False
     # symmetric key for encrypting per-user API keys at rest (see app/crypto.py)
     app_secret: str | None = None
 
@@ -83,12 +95,14 @@ def settings() -> Settings:
     s = Settings()
     # Make the server keys visible to PydanticAI's env-based resolution + the
     # GEMINI/GOOGLE lookups, so models constructed from plain "provider:name"
-    # strings (and the server-fallback path) still find a key.
-    for var, val in (
-        ("ANTHROPIC_API_KEY", s.anthropic_api_key),
-        ("OPENAI_API_KEY", s.openai_api_key),
-        ("GEMINI_API_KEY", s.gemini_api_key),
-    ):
-        if val:
-            os.environ.setdefault(var, val)
+    # strings (and the server-fallback path) still find a key. Skipped entirely
+    # under enforce_byok so PydanticAI can't silently resolve a server key.
+    if not s.enforce_byok:
+        for var, val in (
+            ("ANTHROPIC_API_KEY", s.anthropic_api_key),
+            ("OPENAI_API_KEY", s.openai_api_key),
+            ("GEMINI_API_KEY", s.gemini_api_key),
+        ):
+            if val:
+                os.environ.setdefault(var, val)
     return s
