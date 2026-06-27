@@ -34,6 +34,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 
 from .auth import (
     _bearer,
@@ -63,9 +64,16 @@ async def _bootstrap_user(store: Store) -> None:
         return
     if await store.get_user_by_username(s.bootstrap_username):
         return
-    await store.create_user(
-        new_user_id(), s.bootstrap_username, hash_password(s.bootstrap_password)
-    )
+    try:
+        await store.create_user(
+            new_user_id(), s.bootstrap_username, hash_password(s.bootstrap_password)
+        )
+    except IntegrityError:
+        # Another replica/worker created the same bootstrap user between the
+        # check above and this insert (concurrent startup). Idempotent: the row
+        # exists, which is the desired end state. (create_user is unchanged, so
+        # the registration endpoint still surfaces duplicates as a 409.)
+        pass
 
 
 @asynccontextmanager

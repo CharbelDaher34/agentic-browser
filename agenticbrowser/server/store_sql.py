@@ -20,6 +20,7 @@ import json
 import ssl
 from datetime import datetime
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
@@ -43,6 +44,28 @@ _TA = {"extend_existing": True}
 # Browserbase BYOK creds (api_key + project_id) ride in the same session_api_keys
 # table as the model keys, under this pseudo-provider, as an encrypted JSON blob.
 _BROWSERBASE_PROVIDER = "browserbase"
+
+
+# libpq-only connection params that asyncpg.connect() rejects. Supabase's
+# copy-paste connection string ships "?sslmode=require", which crashes asyncpg
+# with "connect() got an unexpected keyword argument 'sslmode'". We attach our
+# own TLS context in Store.connect(), so these are stripped from the DSN.
+_LIBPQ_SSL_PARAMS = {
+    "sslmode", "ssl", "sslrootcert", "sslcert", "sslkey", "sslpassword", "gssencmode",
+}
+
+
+def _strip_libpq_ssl_params(dsn: str) -> str:
+    """Drop libpq SSL query params asyncpg doesn't understand (TLS is set in code)."""
+    parts = urlsplit(dsn)
+    if not parts.query:
+        return dsn
+    kept = [
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in _LIBPQ_SSL_PARAMS
+    ]
+    return urlunsplit(parts._replace(query=urlencode(kept)))
 
 
 def _ts_col() -> sa.Column:
@@ -171,15 +194,36 @@ class Store:
             dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
         elif dsn.startswith("postgres://"):
             dsn = dsn.replace("postgres://", "postgresql+asyncpg://", 1)
+        # Supabase's dashboard DSN includes "?sslmode=require"; asyncpg.connect()
+        # rejects that kwarg. We attach our own SSL context below, so strip it.
+        dsn = _strip_libpq_ssl_params(dsn)
         # asyncpg caches prepared statements per connection; Supabase/pgbouncer
         # poolers reuse backends, which breaks cached plans — disable the cache.
         connect_args: dict = {"statement_cache_size": 0}
         # Managed Postgres (Supabase etc.) requires TLS; attach an SSL context for
-        # remote hosts but skip it for the local docker-compose Postgres.
+        # remote hosts but skip it for the local docker-compose Postgres. The
+        # Supabase Supavisor pooler presents a cert that fails default chain +
+        # hostname verification, so disable verification (still encrypted — this
+        # is equivalent to libpq sslmode=require). create_default_context() would
+        # raise ssl.SSLCertVerificationError on connect and crash startup.
         if not any(h in dsn for h in ("@localhost", "@127.0.0.1")):
-            connect_args["ssl"] = ssl.create_default_context()
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            connect_args["ssl"] = ctx
         engine = create_async_engine(dsn, pool_pre_ping=True, connect_args=connect_args)
         async with engine.begin() as conn:
+            # Serialize schema creation across concurrently-starting replicas/
+            # workers. On a FRESH database each instance runs create_all at once;
+            # their has_table checks all see "missing" so they all emit CREATE
+            # TABLE, one wins and the rest crash with "duplicate key ...
+            # pg_type_typname_nsp_index (users, ...)". A transaction-scoped
+            # advisory lock lets one instance build the schema while the others
+            # wait, then find the tables already present (create_all's checkfirst
+            # no-ops). Auto-released at COMMIT. Postgres-only — the only backend
+            # this app targets. The literal key is >2^31 so it types as bigint
+            # and resolves the single-arg pg_advisory_xact_lock overload.
+            await conn.execute(sa.text("SELECT pg_advisory_xact_lock(6907314535)"))
             await conn.run_sync(SQLModel.metadata.create_all)
             # create_all won't add columns to a table that already exists, so add
             # newer columns explicitly (no-op if already present).

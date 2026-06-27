@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,8 +29,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # core
-    database_url: str = "postgresql://postgres:postgres@localhost:7935/postgres"
+    # core. Primary env var is SUPABASE_DATABASE_URL (the name set in FastAPI Cloud);
+    # DATABASE_URL is kept as an alias so local dev / older .env files still work.
+    database_url: str = Field(
+        "postgresql://postgres:postgres@localhost:7935/postgres",
+        validation_alias=AliasChoices("SUPABASE_DATABASE_URL", "DATABASE_URL"),
+    )
     browser_provider: str = "local"
     agent_model: str = "anthropic:claude-sonnet-4-6"
     headless: bool = True
