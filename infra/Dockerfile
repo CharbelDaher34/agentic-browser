@@ -30,7 +30,7 @@ WORKDIR /app
 # install deps via the [server]+[mcp] extras (build-system: hatchling). The project
 # copy in site-packages is shadowed by the /app source on PYTHONPATH, so ROOT=/app
 # and the bundled UI is found.
-COPY pyproject.toml README.md LICENSE NOTICE ./
+COPY pyproject.toml README.md LICENSE ./
 COPY agenticbrowser ./agenticbrowser
 RUN uv pip install --system ".[server,mcp]"
 

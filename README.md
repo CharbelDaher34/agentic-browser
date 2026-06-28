@@ -245,5 +245,4 @@ never reads a stray env key), the frozen event contract, and real‑Chromium SDK
 
 ## License
 
-[Apache‑2.0](LICENSE). Portions of the action vocabulary / anti‑automation hardening were
-adapted from a Computer‑Use reference — see [NOTICE](NOTICE).
+[Apache‑2.0](LICENSE).
