@@ -13,5 +13,4 @@ tests
 docs
 infra
 Makefile
-PACKAGING*.md
-applicationdesign.md
+ARCHITECTURE.md

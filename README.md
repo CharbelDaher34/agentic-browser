@@ -213,6 +213,9 @@ versioned contract.
 Postgres, no `.env`, no server. The full multi‑user product (`server/`) is the same
 core with auth, Postgres, and the UI layered on top.
 
+→ Full internals (the `Store` protocol, the orchestrator/sub‑agent split, the per‑tab
+lease model, the event contract, the gateway routes & WebSocket frames): **[ARCHITECTURE.md](ARCHITECTURE.md)**
+
 ---
 
 ## When *not* to use it

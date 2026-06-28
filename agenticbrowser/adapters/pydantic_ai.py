@@ -20,9 +20,9 @@ browsing run (hybrid DOM+vision) behind ONE tool call, so the host model spends
 one round-trip instead of fifty. The destructive-action approval gate runs INSIDE
 the browse_task run; pass `approve=` to decide (omitted => auto-deny, fail-safe).
 
-Deferred (PACKAGING_PLAN.md §4 1b): a fine-grained `BrowserToolset` exposing the
-13 low-level tools with approvals propagating natively as DeferredToolRequests in
-the host's own run — that needs RunContext bridging and lands later.
+Deferred: a fine-grained `BrowserToolset` exposing the 13 low-level tools with
+approvals propagating natively as DeferredToolRequests in the host's own run —
+that needs RunContext bridging and lands later.
 """
 
 from __future__ import annotations

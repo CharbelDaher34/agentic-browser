@@ -16,8 +16,8 @@ from the core unchanged.
 Approval gate: destructive actions (pay/buy/delete/send/checkout) pause the run.
 Provide `approve=` to decide; OMIT it and they are auto-DENIED (fail-safe).
 
-Deferred to a later milestone (documented in PACKAGING_PLAN.md): `live_view()` /
-`takeover()` / `send_input()` (interactive human-takeover) and mid-run `steer()`.
+Deferred to a later milestone: `live_view()` / `takeover()` / `send_input()`
+(interactive human-takeover) and mid-run `steer()`.
 Multi-turn conversation already works by calling `run()`/`stream()` again on the
 same instance — history accumulates in the store under one chat id.
 """

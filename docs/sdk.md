@@ -139,4 +139,4 @@ opens/closes a browser per call.
 Interactive human-takeover (`live_view()` / `takeover()` / `send_input()`),
 mid-run `steer()`, the fine-grained 13-tool `BrowserToolset` (with approvals
 propagating as native `DeferredToolRequests` in your own agent run), and a `$`
-cost price table. See `PACKAGING_PLAN.md`.
+cost price table — all deferred to a later milestone.
