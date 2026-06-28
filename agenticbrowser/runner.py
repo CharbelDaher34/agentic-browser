@@ -11,6 +11,7 @@ are persisted to Postgres at the end of the turn.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 
 from pydantic_ai import (
@@ -30,15 +31,19 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.tools import DeferredToolResults, ToolApproved, ToolDenied
+from pydantic_ai.usage import UsageLimits
+from pydantic_ai.exceptions import UsageLimitExceeded
 
 from .agent import AgentDeps, agent
-from .config import settings
+from .config import CoreConfig
 from .history import well_formed
 from .models import StreamEvent
-from .models_registry import build_model, pick_model
+from .models_registry import resolve_model
 from .recorder import Recorder
 from .registry import SessionRegistry
-from .store import Store
+from .stores import Store
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,10 +62,15 @@ class _Accum:
 
 class Runner:
     def __init__(
-        self, registry: SessionRegistry, store: Store, recorder: Recorder
+        self,
+        registry: SessionRegistry,
+        store: Store,
+        recorder: Recorder,
+        cfg: CoreConfig | None = None,
     ) -> None:
         self.registry = registry
         self.store = store
+        self._cfg = cfg or CoreConfig()
         self.recorder = recorder
         self._pending: dict[str, asyncio.Future[dict]] = {}
         self._inflight: set[str] = set()
@@ -149,23 +159,45 @@ class Runner:
             # continue the per-chat step counter rather than resetting to 0,
             # so step idx stays monotonic across turns (correct replay trail).
             start_idx = await self.store.max_step_idx(chat_id)
-            # BYOK: this session's keys (decrypted) override the server keys per
-            # provider. Keys are per-session and purged when the session is reaped.
-            try:
-                user_keys = await self.store.load_session_keys(session_id)
-            except Exception:  # noqa: BLE001 — never block a turn on key loading
-                user_keys = {}
             deps = AgentDeps(
                 session_id, chat_id, lease.token, self.registry, self.recorder,
-                emit, _idx=[start_idx], user_keys=user_keys,
+                emit, _idx=[start_idx], cfg=self._cfg,
             )
-            # orchestrator runs on whichever provider this session has a key for
-            orch_model = build_model(pick_model("smart", user_keys), user_keys)
+            # orchestrator runs on the configured agent_model (resolved to whichever
+            # provider this process has a key for)
+            orch_model = resolve_model(self._cfg.agent_model, self._cfg)
             # Heal any history saved with a dangling tool_use (e.g. a turn that was
             # interrupted while a tool call / approval was pending) so Anthropic
             # doesn't reject it; also re-persists the cleaned history at turn end.
             history = well_formed(await self.store.load_messages(chat_id))
             deferred: DeferredToolResults | None = None
+
+            # cost observability (W-C): accumulate token/request usage across the
+            # turn's segments (a turn can span multiple runs when approvals pause it)
+            # and enforce the configured budgets. request_limit is disabled (None) so
+            # we don't inherit PydanticAI's default 50-request cap — a browsing turn
+            # legitimately makes many requests; max_steps/max_tokens are the knobs.
+            usage_in = usage_out = usage_req = 0
+
+            def _usage_payload() -> dict:
+                # the turn's accumulated usage so far — emitted on EVERY terminal
+                # path (final, interrupted, budget) so the UI always gets a total.
+                return {
+                    "steps": max(0, deps._idx[0] - start_idx),
+                    "requests": usage_req,
+                    "input_tokens": usage_in,
+                    "output_tokens": usage_out,
+                    "total_tokens": usage_in + usage_out,
+                    "cost_usd": None,  # populated when the W-C price table lands
+                }
+
+            ulimits = None
+            if self._cfg.max_steps or self._cfg.max_tokens:
+                ulimits = UsageLimits(
+                    request_limit=None,
+                    tool_calls_limit=self._cfg.max_steps,
+                    total_tokens_limit=self._cfg.max_tokens,
+                )
 
             while True:
                 result = None
@@ -175,6 +207,7 @@ class Runner:
                     message_history=history,
                     deferred_tool_results=deferred,
                     model=orch_model,
+                    usage_limits=ulimits,
                 ) as events:
                     async for ev in events:
                         if isinstance(ev, AgentRunResultEvent):
@@ -184,6 +217,17 @@ class Runner:
 
                 prompt, deferred = None, None
                 history = result.all_messages()
+                try:
+                    # pydantic-ai v2: `result.usage` is a property (RunUsage), not a
+                    # method — calling it raises and (formerly) silently zeroed usage.
+                    _u = result.usage
+                    usage_in += _u.input_tokens
+                    usage_out += _u.output_tokens
+                    usage_req += _u.requests
+                except Exception:  # noqa: BLE001 — never fail a turn on usage accounting
+                    # log (don't crash) so a future pydantic-ai API change that breaks
+                    # usage reading is visible instead of silently showing 0 tokens.
+                    log.warning("usage accounting failed for chat %s", chat_id, exc_info=True)
 
                 if isinstance(result.output, DeferredToolRequests):
                     approvals = await self._collect(chat_id, result.output, emit)
@@ -198,6 +242,7 @@ class Runner:
                     await self.store.save_storage_state(session_id, state, last_url=sess.url)
                 except Exception:  # noqa: BLE001
                     pass
+                await emit(StreamEvent("usage", chat_id, _usage_payload()))
                 await emit(StreamEvent("final", chat_id, {"text": result.output}))
                 return result.output
         except asyncio.CancelledError:
@@ -209,8 +254,20 @@ class Runner:
                 await asyncio.shield(self._persist_partial(chat_id, history, prompt, acc))
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                await emit(StreamEvent("usage", chat_id, _usage_payload()))
+            except Exception:  # noqa: BLE001 — never block the unwind on usage
+                pass
             await emit(StreamEvent("interrupted", chat_id, {"text": acc.text_blob()}))
             raise
+        except UsageLimitExceeded as exc:
+            # a configured budget (max_steps/max_tokens) was hit — report cleanly.
+            try:
+                await emit(StreamEvent("usage", chat_id, _usage_payload()))
+            except Exception:  # noqa: BLE001
+                pass
+            await emit(StreamEvent("error", chat_id, {"msg": f"Budget exceeded: {exc}"}))
+            return ""
         except Exception as exc:  # noqa: BLE001
             await emit(StreamEvent("error", chat_id, {"msg": f"Agent error: {exc}"}))
             return ""

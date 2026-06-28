@@ -34,16 +34,11 @@ from sqlalchemy.ext.asyncio import (
 from sqlmodel import Field, SQLModel, select
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
-from .crypto import decrypt, encrypt
-from .models import StepRecord
+from ..models import StepRecord
 
 # extend_existing so importing this module twice (e.g. uvicorn --reload) doesn't
 # raise "Table already defined" against SQLModel's shared metadata.
 _TA = {"extend_existing": True}
-
-# Browserbase BYOK creds (api_key + project_id) ride in the same session_api_keys
-# table as the model keys, under this pseudo-provider, as an encrypted JSON blob.
-_BROWSERBASE_PROVIDER = "browserbase"
 
 
 # libpq-only connection params that asyncpg.connect() rejects. Supabase's
@@ -78,19 +73,6 @@ class User(SQLModel, table=True):
     user_id: str = Field(primary_key=True)
     username: str = Field(sa_column=sa.Column(sa.Text, unique=True, nullable=False))
     password_hash: str
-    created_at: Optional[datetime] = Field(default=None, sa_column=_ts_col())
-
-
-class SessionApiKey(SQLModel, table=True):
-    """BYOK keys scoped to a browser session (encrypted at rest), one row per
-    provider. Web users bring their own keys per session; the rows are purged
-    when the session is reaped (ON DELETE CASCADE covers an explicit session
-    delete; reap_idle deletes them explicitly since reaping keeps the row)."""
-    __tablename__ = "session_api_keys"
-    __table_args__ = _TA
-    session_id: str = Field(primary_key=True, foreign_key="sessions.session_id", ondelete="CASCADE")
-    provider: str = Field(primary_key=True)   # anthropic | openai | google | browserbase
-    encrypted_key: str
     created_at: Optional[datetime] = Field(default=None, sa_column=_ts_col())
 
 
@@ -257,98 +239,9 @@ class Store:
             u = (await s.execute(select(User).where(User.user_id == user_id))).scalars().first()
         return {"user_id": u.user_id, "username": u.username} if u else None
 
-    # ---- per-SESSION BYOK keys (encrypted at rest; purged when session reaped) ---
-    async def save_session_key(self, session_id: str, provider: str, plaintext: str) -> None:
-        enc = encrypt(plaintext)
-        async with self._sm() as s:
-            await s.execute(
-                pg_insert(SessionApiKey)
-                .values(session_id=session_id, provider=provider, encrypted_key=enc)
-                .on_conflict_do_update(
-                    index_elements=["session_id", "provider"], set_={"encrypted_key": enc}
-                )
-            )
-            await s.commit()
-
-    async def load_session_keys(self, session_id: str) -> dict[str, str]:
-        """Decrypted {provider: api_key} of a session's MODEL keys (excludes the
-        2-field browserbase blob; skips any that fail to decrypt)."""
-        async with self._sm() as s:
-            rows = (
-                await s.execute(
-                    select(SessionApiKey.provider, SessionApiKey.encrypted_key).where(
-                        SessionApiKey.session_id == session_id,
-                        SessionApiKey.provider != _BROWSERBASE_PROVIDER,
-                    )
-                )
-            ).all()
-        out: dict[str, str] = {}
-        for provider, enc in rows:
-            pt = decrypt(enc)
-            if pt:
-                out[provider] = pt
-        return out
-
-    async def delete_session_key(self, session_id: str, provider: str) -> None:
-        async with self._sm() as s:
-            await s.execute(
-                sa.delete(SessionApiKey).where(
-                    SessionApiKey.session_id == session_id,
-                    SessionApiKey.provider == provider,
-                )
-            )
-            await s.commit()
-
-    async def delete_session_keys(self, session_id: str) -> None:
-        """Purge ALL of a session's keys (called when the session is reaped)."""
-        async with self._sm() as s:
-            await s.execute(
-                sa.delete(SessionApiKey).where(SessionApiKey.session_id == session_id)
-            )
-            await s.commit()
-
-    async def list_session_key_providers(self, session_id: str) -> list[str]:
-        async with self._sm() as s:
-            rows = (
-                await s.execute(
-                    select(SessionApiKey.provider).where(
-                        SessionApiKey.session_id == session_id
-                    )
-                )
-            ).scalars().all()
-        return list(rows)
-
-    async def save_session_browserbase_creds(
-        self, session_id: str, api_key: str, project_id: str
-    ) -> None:
-        await self.save_session_key(
-            session_id, _BROWSERBASE_PROVIDER,
-            json.dumps({"api_key": api_key, "project_id": project_id}),
-        )
-
-    async def load_session_browserbase_creds(self, session_id: str) -> dict | None:
-        """{'api_key','project_id'} for a session, or None if unset/undecryptable."""
-        async with self._sm() as s:
-            enc = (
-                await s.execute(
-                    select(SessionApiKey.encrypted_key).where(
-                        SessionApiKey.session_id == session_id,
-                        SessionApiKey.provider == _BROWSERBASE_PROVIDER,
-                    )
-                )
-            ).scalars().first()
-        if not enc:
-            return None
-        pt = decrypt(enc)
-        if not pt:
-            return None
-        try:
-            d = json.loads(pt)
-        except Exception:  # noqa: BLE001
-            return None
-        if d.get("api_key") and d.get("project_id"):
-            return {"api_key": d["api_key"], "project_id": d["project_id"]}
-        return None
+    # Keys are not a store concern — this deployment uses the provider keys from its
+    # own environment (Settings -> CoreConfig.provider_keys / browserbase_*), so there
+    # is nothing per-session to store.
 
     # ---- auth sessions (login tokens) --------------------------------------
     async def create_token(self, token: str, user_id: str, expires_at: datetime) -> None:
@@ -643,14 +536,14 @@ class Store:
             )
             await s.commit()
 
-    async def list_steps(self, chat_id: str) -> list[dict]:
+    async def list_steps(self, chat_id: str, since: int = 0) -> list[dict]:
         async with self._sm() as s:
-            # insertion order (id) so the replay trail is correct across turns
-            rows = (
-                await s.execute(
-                    select(Step).where(Step.chat_id == chat_id).order_by(sa.asc(Step.id))
-                )
-            ).scalars().all()
+            # insertion order (id) so the replay trail is correct across turns;
+            # `since` (a step idx) lets clients fetch only new steps incrementally.
+            stmt = select(Step).where(Step.chat_id == chat_id)
+            if since:
+                stmt = stmt.where(Step.idx > since)
+            rows = (await s.execute(stmt.order_by(sa.asc(Step.id)))).scalars().all()
         return [
             {"idx": r.idx, "action": r.action, "result": r.result,
              "screenshot_uri": r.screenshot_uri, "created_at": r.created_at}

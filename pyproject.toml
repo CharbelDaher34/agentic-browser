@@ -1,24 +1,72 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agenticbrowser"]
+
 [project]
 name = "agenticbrowser"
 version = "0.1.0"
-description = "Agentic browser chatbot — FastAPI + PydanticAI v2 + Playwright, users/sessions, Postgres"
+description = "Agentic browser agent — hybrid DOM+vision Playwright agent with approval gate, human takeover, multi-provider keys; embeddable headless or run as a service"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: FastAPI",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Intended Audience :: Developers",
+]
+# Core (headless SDK) deps — importable with no FastAPI/Postgres. The server,
+# adapters, and mcp surfaces are optional extras below.
 dependencies = [
-    "asyncpg>=0.31.0",
-    "browserbase>=1.4.0",
-    "fastapi[standard]>=0.138.0",
-    "playwright>=1.60.0",
     "pydantic-ai-slim[anthropic,google,openai]==2.0.0",
-    "pydantic-evals>=2.0.0",
-    "pydantic-settings>=2.5.0",
-    "python-multipart>=0.0.32",
-    "sqlmodel>=0.0.38",
-    "uvicorn[standard]>=0.49.0",
-    "websockets>=16.0",
+    "playwright>=1.60.0",
+    "browserbase>=1.4.0",
+    "aiosqlite>=0.20.0",
 ]
 
-# Entrypoint for FastAPI Cloud / the `fastapi` CLI — the real app lives in
-# app/gateway.py and is re-exported by main.py (see that file).
-[tool.fastapi]
-entrypoint = "main:app"
+[project.optional-dependencies]
+# The self-host gateway (Group 2) + multi-user Postgres stack.
+server = [
+    "fastapi[standard]>=0.138.0",
+    "uvicorn[standard]>=0.49.0",
+    "sqlmodel>=0.0.38",
+    "asyncpg>=0.31.0",
+    "pydantic-settings>=2.5.0",
+    "python-multipart>=0.0.32",
+]
+mcp = ["mcp>=1.20.0"]
+evals = ["pydantic-evals>=2.0.0"]
+otel = ["opentelemetry-sdk>=1.27.0"]
+
+# Local-dev environment: the FULL stack (server + mcp + evals + tests). uv installs
+# the `dev` group by DEFAULT (`uv sync` / `uv run` / `make run`), so the app and tests
+# work out of the box. Consumers installing a single surface use the lean extras above.
+[dependency-groups]
+dev = [
+    "fastapi[standard]>=0.138.0",
+    "uvicorn[standard]>=0.49.0",
+    "sqlmodel>=0.0.38",
+    "asyncpg>=0.31.0",
+    "pydantic-settings>=2.5.0",
+    "python-multipart>=0.0.32",
+    "mcp>=1.20.0",
+    "pydantic-evals>=2.0.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+# Fetch the Chromium binary for the local backend.
+agenticbrowser-install = "agenticbrowser.install:main"
+# MCP server (needs the [mcp] extra).
+agenticbrowser-mcp = "agenticbrowser.mcp.server:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

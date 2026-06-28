@@ -19,8 +19,8 @@ The hard part is already done:
 The **one blocker** to "download and integrate": the agent core is welded to
 Postgres (`Runner → Registry → Recorder → Store`) and to a global `settings()`
 singleton that reads `.env` on import. So `import agenticbrowser` today would try
-to reach a DB and could resolve a stray server key — silently breaking the
-`enforce_byok` promise.
+to reach a DB and could resolve a stray env key — silently using a key the caller
+never passed.
 
 **One ~M-sized refactor unlocks 4 of the 7 form-factors below.** See
 [The unifying refactor](#the-unifying-refactor).
@@ -35,13 +35,14 @@ to reach a DB and could resolve a stray server key — silently breaking the
 |---|---|---|---|---|---|
 | 1 | **Python SDK** | `async with BrowserAgent(...) as a: await a.run("book a table")` | Python backends, AI builders | optional/none | M |
 | 2 | **Framework adapters** | `Agent(toolset=BrowserToolset(browser))` — PydanticAI / LangChain / CrewAI / Temporal | teams on an agent stack | none | S→L |
-| 3 | **MCP server** | `uvx browser-agent-mcp` → `browse_task(goal)` in Claude Desktop / Cursor | MCP-host builders | none | L |
-| 4 | **CLI** | `uvx agenticbrowser run "extract prices" --json --headless` | RPA / CI / cron / SRE | none (`--watch` opt-in) | M |
+| 3 | **MCP server** | `uvx agenticbrowser-mcp` → `browse_task(goal)` in Claude Desktop / Cursor | MCP-host builders | none | L |
+
+> A standalone CLI was considered and **dropped** — the SDK + MCP server cover
+> scripting/automation needs.
 
 One library + thin wrappers. The SDK is the foundation; the PydanticAI adapter is
 near-zero code (the tools in [agent.py](app/agent.py) are *already* PydanticAI v2
-functions); the CLI is a TTY/JSON shell over it; the MCP server is a FastMCP
-wrapper over it.
+functions); the MCP server is a FastMCP wrapper over it.
 
 **Standout vs. browser-use / Stagehand / Playwright-MCP:** those give click/type
 with no human in the loop. This carries the **approval gate** (pay/buy/delete
@@ -115,7 +116,7 @@ the OSS path has pull.
 - Competitive/price monitoring on JS/canvas/map sites that **beat DOM-only scrapers** (vision mode + `locate()`).
 - Resilient RPA replacing selector-based UiPath/Blue Prism flows.
 - Compliance evidence capture — the per-step screenshot trail in [recorder.py](app/recorder.py) as a tamper-evident audit record.
-- Synthetic monitoring / CI smoke; agent-eval harnesses swapping providers via tier+BYOK.
+- Synthetic monitoring / CI smoke; agent-eval harnesses swapping providers via the model + key.
 - AI agent "hands on the web" — another LLM app calls `browse_task()`.
 
 **Anti-patterns (wrong tool):** high-volume scraping when a clean API/static HTML
@@ -130,20 +131,23 @@ concurrent browsers (each session is heavyweight).
 > Kill the `from .config import settings` global and the concrete-`Store` import;
 > replace both with injected dependencies.
 
-1. **`CoreConfig` dataclass** (headless, enforce_byok, tab/subagent limits, server
-   keys, browserbase creds) threaded via `AgentDeps`, so `agent.py`,
+1. **`CoreConfig` dataclass** (headless, tab/subagent limits, server keys,
+   browserbase creds) threaded via `AgentDeps`, so `agent.py`,
    `providers.py`, `registry.py`, `models_registry.py` stop calling `settings()`
    at runtime. `Settings` becomes one producer of a `CoreConfig`.
-2. **Narrow `Store` Protocol** — the core touches only ~14 methods (registry:
-   `load_storage_state`/`upsert_session`/`load_session_browserbase_creds`/…;
+2. **Narrow `Store` Protocol** — the core touches only ~11 methods (registry:
+   `load_storage_state`/`upsert_session`/`load_bb_session_id`/…;
    runner: `max_step_idx`/`load_messages`/`save_messages`/…; recorder:
-   `insert_step`). Ship `MemoryStore` + `SqliteStore`. The SQLModel class keeps all
-   auth/chat/user methods and stays gateway-only.
+   `insert_step`). Keys are NOT a store concern — they live in `CoreConfig`. Ship
+   `MemoryStore` + `SqliteStore`. The SQLModel class keeps all auth/chat/user methods
+   and stays gateway-only.
 3. **`ArtifactStore` is already a Protocol** ([recorder.py](app/recorder.py)) — just
    add `NullArtifacts` / `MemoryArtifacts`. Recorder & registry need only type-hint swaps.
-4. **Make `enforce_byok` + server-key dict injectable** in
+4. **Make the provider-key dict injectable** in
    [models_registry.py](app/models_registry.py) — *today it can resolve a stray
-   server key, invalidating the BYOK story.* Fix in the same PR.
+   env key the caller never passed.* Keys come ONLY from `CoreConfig.provider_keys`
+   (the SDK's `keys=`, or the server's .env) — no per-session key, no ambient-env
+   fallback. Fix in the same PR.
 
 Result: `import agenticbrowser` works with no `.env` and no Postgres. Unlocks the
 SDK, adapters, MCP server, and CLI from one PR. The other three (Browserbox,
@@ -154,7 +158,7 @@ embed, SaaS) don't need it.
 ## Roadmap
 
 - **Phase 0 — Prove the seam (1 PR, make-or-break):** CoreConfig + Store Protocol +
-  Memory/SQLite impls + injectable BYOK + a conformance test (same scripted run
+  Memory/SQLite impls + injectable provider keys + a conformance test (same scripted run
   against MemoryStore and SqliteStore → identical step trail / message history).
 - **Phase 1 — Ship the core:** `BrowserAgent` SDK **+** PydanticAI `BrowserToolset`
   adapter as one workstream. Add an `agenticbrowser install` step for Playwright
@@ -178,7 +182,7 @@ embed, SaaS) don't need it.
   allowlist + untrusted-content framing.
 - **Freeze + version the `StreamEvent` contract** — it's the shared wire format
   across SDK/CLI/MCP/webhooks/embed; add a CI test that fails on a renamed/dropped event.
-- **Cost/observability** — the agent silently burns BYOK budget inside one `run()`;
+- **Cost/observability** — the agent silently burns API budget inside one `run()`;
   surface step/token/$ caps + OpenTelemetry spans.
 - **Sandboxing** — "embed in your Celery worker" means arbitrary web JS runs next to
   app secrets; recommend containerized Chromium by default.

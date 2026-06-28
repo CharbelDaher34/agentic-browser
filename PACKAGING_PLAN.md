@@ -4,13 +4,42 @@ Companion to [PACKAGING.md](PACKAGING.md). Scope locked by the following decisio
 
 - **License: Apache-2.0** (permissive, maximize adoption).
 - **No SaaS** — Group 4 (hosted multi-tenant) is dropped.
-- **Ship Groups 1, 2, 3:** the embeddable core (SDK + adapters + MCP + CLI), the
-  self-host Docker service, and the embeddable frontend widget.
+- **Ship Groups 1 & 2:** the embeddable core (SDK + adapters + MCP server) and the
+  self-host Docker service. (No CLI and no embeddable frontend widget — out of scope; the
+  existing `frontend/` covers the UI need.)
 - Four cross-cutting must-haves: **freeze+version the StreamEvent contract**, **cost
   observability**, **improve the approval gate**, **Apache-2.0 licensing**.
 
 Everything rides one decoupled core (Phase 0). The four cross-cutting workstreams
 (W-A…W-D) land alongside Phase 0 because every form-factor depends on them.
+
+---
+
+## Status
+
+**Shipped: SDK + PydanticAI adapter + MCP + Docker self-host** (branch
+`packaging-m0`, uncommitted). 28 Python tests pass (incl. real-Chromium E2E); the
+wheel builds and `docker compose config` validates.
+
+- **M0:** imports as `agenticbrowser` with **no `.env`/Postgres**; keys come only from
+  what's passed (no env fallback); event contract frozen + tested. (§9)
+- **M1:** **`BrowserAgent` SDK** + **PydanticAI adapter** (`browse_task`) +
+  `agenticbrowser-install`; runner emits a `usage` event + enforces `max_steps`/`max_tokens`.
+  ([docs/sdk.md](docs/sdk.md); §10)
+- **M2 (Group 1c):** **MCP server** — `browse_task` + session tools, approval-as-elicitation,
+  `agenticbrowser-mcp`, `[mcp]` extra. ([docs/mcp.md](docs/mcp.md); §11)
+- **M3 (Group 2):** **Docker self-host** — Dockerfile + compose, `SERVE_UI`, fire-and-forget
+  **polling** runs (`POST /api/chats/{id}/runs`, `GET /api/runs/{id}`, `/stop`, `/approvals`).
+  ([docs/self-host.md](docs/self-host.md); §11)
+
+**Out of scope** (no concrete consumer to justify the maintenance surface): a **CLI** (the
+SDK + MCP cover scripting/automation); a **React widget** (the existing `frontend/` already
+covers "with a frontend"); and **webhook push** (the runs plane is polling-only). The
+single-team self-host uses provider keys from its `.env`, so there is no per-session
+key-entry surface; deploy is Docker / local self-host only.
+
+**Deferred (not started):** W-C cost `$` price table + OTel; W-D approval-gate v2;
+SDK `live_view()`/`takeover()`/`steer()`; the fine-grained 13-tool `BrowserToolset`.
 
 ---
 
@@ -24,25 +53,21 @@ Everything rides one decoupled core (Phase 0). The four cross-cutting workstream
         │
         ├──► Group 1a  Python SDK (BrowserAgent)
         │        ├──► 1b  PydanticAI adapter  (near-zero code)
-        │        ├──► 1c  MCP server          (FastMCP wrapper)
-        │        └──► 1d  CLI                 (TTY/JSON shell)
+        │        └──► 1c  MCP server          (FastMCP wrapper)
         │
-        ├──► Group 2   Docker self-host       (needs NO Phase 0; needs W-B for clients)
-        │
-        └──► Group 3   Embeddable widget      (needs NO Phase 0; needs W-B for TS types)
+        └──► Group 2   Docker self-host       (needs NO Phase 0)
 ```
 
 | Milestone | Contents | Gate |
 |---|---|---|
-| **M0** | W-A, Phase 0, W-B/W-C/W-D foundations | conformance test green; `import agenticbrowser` works with no `.env`/DB |
-| **M1** | Group 1a SDK + 1b PydanticAI adapter | `pip install`, `await agent.run(...)` works headless |
-| **M2** | Group 1c MCP + 1d CLI | `uvx` runs both; approval + usage flow through |
-| **M3** | Group 2 Docker self-host | `docker compose up` → REST/WS + webhook; codegen clients |
-| **M4** | Group 3 widget | `@agenticbrowser/react` + web component + iframe; old frontend consumes it |
+| **M0 ✅** | W-A, Phase 0, W-B + key-resolution fix | conformance test green; `import agenticbrowser` works with no `.env`/DB |
+| **M1 ✅** | Group 1a SDK + 1b PydanticAI adapter; usage event + budgets | `await agent.run(...)` works headless (real-Chromium E2E green) |
+| **M2 ✅** | Group 1c MCP server | `browse_task` + session tools + approval-as-elicitation; 7 tests |
+| **M3 ✅** | Group 2 Docker self-host | Dockerfile + compose + polling `/runs` API (wheel builds, compose valid) |
 
 ---
 
-## 1. Package & repo restructure (prereq for `pip install`)
+## 1. Package & repo restructure (prereq for distribution)
 
 The import name is currently `app` — unshippable. Target: one distribution
 `agenticbrowser` with optional extras, core importable with zero server deps.
@@ -50,7 +75,7 @@ The import name is currently `app` — unshippable. Target: one distribution
 **Target layout:**
 
 ```
-agenticbrowser/                 # pip-installable CORE + SDK (no FastAPI, no Postgres)
+agenticbrowser/                 # installable CORE + SDK (no FastAPI, no Postgres)
   __init__.py                   # public exports: BrowserAgent, StreamEvent, Approval, ...
   agent.py runner.py registry.py session.py providers.py     # moved from app/
   models.py models_registry.py history.py
@@ -64,27 +89,23 @@ agenticbrowser/                 # pip-installable CORE + SDK (no FastAPI, no Pos
   sdk.py                        # NEW BrowserAgent (Group 1a)
   adapters/__init__.py pydantic_ai.py langchain.py crewai.py temporal.py   # Group 1b
   mcp/server.py                 # Group 1c
-  cli.py                        # Group 1d
   server/                       # the GATEWAY (moved from app/, server-only)
-    gateway.py auth.py crypto.py settings.py store_sql.py
-frontend/                       # unchanged app; later consumes packages/react
-packages/react/                 # Group 3 npm package (@agenticbrowser/react)
+    gateway.py auth.py settings.py store_sql.py
+frontend/                       # unchanged app
 LICENSE NOTICE                  # W-A
 ```
 
 **Migration tasks**
 
 - [ ] `git mv app/{agent,runner,registry,session,providers,recorder,models,models_registry,history}.py agenticbrowser/`
-- [ ] `git mv app/gateway.py app/auth.py app/crypto.py agenticbrowser/server/`; rename
+- [ ] `git mv app/gateway.py app/auth.py agenticbrowser/server/`; rename
       `app/store.py` → `agenticbrowser/server/store_sql.py` (the SQLModel/Postgres impl,
       keeps **all** user/auth/chat methods).
 - [ ] Split `app/config.py`: the `Settings` (pydantic-settings) class →
       `agenticbrowser/server/settings.py`; the new `CoreConfig` → `agenticbrowser/config.py`.
 - [ ] Fix imports (`.config import settings` → see Phase 0); keep relative imports inside the package.
 - [ ] **Deploy shim:** `main.py` becomes `from agenticbrowser.server.gateway import app`;
-      update `pyproject.toml [tool.fastapi] entrypoint` stays `main:app` (unchanged); verify
-      `.fastapicloud/` build still finds it. `run.sh` uvicorn target →
-      `agenticbrowser.server.gateway:app`.
+      `run.sh` uvicorn target → `agenticbrowser.server.gateway:app`.
 - [ ] `pyproject.toml`: package discovery for `agenticbrowser*`; extras
       `[server]` (fastapi, sqlmodel, asyncpg, uvicorn, python-multipart),
       `[mcp]` (mcp/fastmcp), `[adapters]` (langchain, temporalio…), `[otel]`
@@ -113,10 +134,9 @@ class CoreConfig:
     headless: bool = True                     # providers.py:82
     browserbase_api_key: str | None = None    # providers.py:112 fallback
     browserbase_project_id: str | None = None
-    # models / BYOK
+    # models / provider keys
     agent_model: str = "anthropic:claude-sonnet-4-6"   # models_registry:85,99
-    enforce_byok: bool = True                 # models_registry:76,113 ; providers:112
-    server_keys: dict[str, str | None] = field(default_factory=dict)  # {anthropic,openai,google}
+    provider_keys: dict[str, str | None] = field(default_factory=dict)  # {anthropic,openai,google}
     # agent limits
     max_subagent_depth: int = 1               # agent.py:485
     max_concurrent_subagents: int = 1         # agent.py:411,485
@@ -141,16 +161,17 @@ class CoreConfig:
 - [ ] `registry.py` — `SessionRegistry.__init__(store, cfg)`; replace :63 (`browser_provider`)
       and :190 (`idle_ttl_seconds`). Pass `cfg` into `make_provider(...)` and into
       `PlaywrightSession.open(...)`.
-- [ ] `providers.py` — `make_provider(name, *, cfg, browserbase_creds=None)`;
-      `LocalProvider(cfg)` uses `cfg.headless` (:82); `BrowserbaseProvider(cfg, ...)`
-      uses `cfg.enforce_byok` + fallback creds (:112); :195 default from `cfg`.
+- [ ] `providers.py` — `make_provider(name, *, cfg)`;
+      `LocalProvider(cfg)` uses `cfg.headless` (:82); `BrowserbaseProvider(cfg)`
+      uses `cfg.browserbase_*` (:112); :195 default from `cfg`.
 - [ ] `session.py` — pass screencast params (`cfg`) into `PlaywrightSession`; replace :393, :408.
-- [ ] `models_registry.py` — make `enforce_byok` + `server_keys` injectable. Functions
-      `_server_key`, `_pick_key`, `available_providers`, `pick_model`, `build_model`,
-      `build_vision_model` take a `cfg: CoreConfig` (or a small `KeyResolver` built from it).
+- [ ] `models_registry.py` — make `provider_keys` injectable. Functions
+      `_pick_key`, `available_providers`, `pick_model`, `build_model`,
+      `build_vision_model` take a `cfg: CoreConfig`.
       **This is the single most important fix:** today (:67,:76,:113) it can resolve a stray
-      server key from env, contradicting `enforce_byok`. After this, an embed with
-      `enforce_byok=True` and only user keys can never touch a server/env key.
+      key from `os.environ`. After this, keys come ONLY from `cfg.provider_keys` (no
+      per-session key, no ambient-env fallback) — an embed with only its own keys can never
+      touch a stray env key.
 - [ ] `server/gateway.py` lifespan — build `cfg = settings().to_core_config()` once; pass
       to `SessionRegistry(store, cfg)`, `Recorder(store, artifacts)`, `Runner(...)`. Add
       `Settings.to_core_config()` in `server/settings.py` (the one producer).
@@ -159,7 +180,9 @@ class CoreConfig:
 
 ### 2.2 `Store` Protocol + impls — `agenticbrowser/stores.py`
 
-The core calls **exactly 14 methods** (grep-verified across registry/runner/recorder):
+The core calls **exactly 11 methods** (grep-verified across registry/runner/recorder).
+Keys are NOT a Store concern — they live in `CoreConfig.provider_keys` (and browserbase
+creds in `CoreConfig.browserbase_*`), never the store:
 
 ```python
 class Store(Protocol):
@@ -171,25 +194,19 @@ class Store(Protocol):
     async def save_bb_session_id(self, session_id, bb_id) -> None: ...
     async def upsert_session(self, session_id, provider) -> None: ...
     async def get_session(self, session_id) -> dict | None: ...
-    async def load_session_browserbase_creds(self, session_id) -> dict | None: ...
-    async def delete_session_keys(self, session_id) -> None: ...
     # runner.py
     async def load_messages(self, chat_id) -> list: ...
     async def save_messages(self, chat_id, messages) -> None: ...
     async def max_step_idx(self, chat_id) -> int: ...
-    async def load_session_keys(self, session_id) -> dict[str, str]: ...
     # recorder.py
     async def insert_step(self, rec: StepRecord) -> None: ...
 ```
 
 - [ ] Define the Protocol; the existing SQL class (`server/store_sql.py`) already satisfies
       it (plus its server-only user/auth/chat methods) — add `Store` to its bases for clarity.
-- [ ] `MemoryStore` — dicts in RAM. `load_session_keys` / `load_session_browserbase_creds`
-      return the **keys injected via constructor** (NOT a DB lookup → `crypto.py`/`auth.py`
-      never imported). `save_*`/`delete_*` are no-ops or RAM writes. Messages + steps held in lists.
+- [ ] `MemoryStore` — dicts in RAM. Messages + steps held in lists. No key/cred state.
 - [ ] `SqliteStore(path)` — `aiosqlite`, **WAL mode** (sub-agents write steps concurrently).
-      Persists storage_state, bb_session_id, last_url, messages-blob, steps. Key methods
-      delegate to injected keys (keys are provided per-construction, not persisted in embed mode).
+      Persists storage_state, bb_session_id, last_url, messages-blob, steps. No key/cred state.
 - [ ] Conformance test (below) guarantees no method is missing at runtime.
 
 ### 2.3 Artifacts — `agenticbrowser/artifacts.py`
@@ -206,8 +223,8 @@ class Store(Protocol):
 - [ ] `tests/test_store_conformance.py` — run an identical scripted agent run (a stub
       provider that returns canned observations) against `MemoryStore` and `SqliteStore`;
       assert identical step trail + message history. Fails if any Store method is unimplemented.
-- [ ] `tests/test_no_env.py` — `import agenticbrowser; BrowserAgent(keys={...}, enforce_byok=True)`
-      with **no `.env` and no DATABASE_URL**; assert it constructs and never reads env keys.
+- [ ] `tests/test_no_env.py` — `import agenticbrowser; BrowserAgent(keys={...})` with
+      **no `.env` and no DATABASE_URL**; assert it constructs and never reads env keys.
 
 **Acceptance:** `import agenticbrowser` works with no Postgres and no `.env`; the gateway
 still boots unchanged via `Settings.to_core_config()`.
@@ -226,12 +243,11 @@ still boots unchanged via `Settings.to_core_config()`.
       Apache/MIT-compatible and record it in `NOTICE`; if not, reimplement or get clearance.
 - [ ] Per-file SPDX headers (`# SPDX-License-Identifier: Apache-2.0`) via a one-shot script.
 - [ ] README license badge + `CONTRIBUTING.md` + DCO sign-off (lighter than a CLA).
-- [ ] npm `packages/react/package.json`: `"license": "Apache-2.0"`.
 
 ### W-B — Freeze + version the StreamEvent contract
 
-The `emit`/`StreamEvent` union (13 types, `models.py:136-144`) is the shared wire format
-for SDK `stream()`, CLI `--ndjson`, MCP progress, webhooks, **and** the React embed.
+The `emit`/`StreamEvent` union is the shared wire format for SDK `stream()`, MCP
+progress, **and** the gateway's chat WS / polling runs.
 
 - [ ] Move `StreamEvent` to `agenticbrowser/events.py`; add `EVENT_SCHEMA_VERSION = "1.0"`.
 - [ ] **Type the `data` payloads** — today `data` is an untyped `Mapping`. Define a typed
@@ -240,12 +256,11 @@ for SDK `stream()`, CLI `--ndjson`, MCP progress, webhooks, **and** the React em
       lease, live_view, subagent_start, subagent_end, interrupted` — plus the new
       `usage` event (W-C). Emit a machine-readable JSON Schema (`events.schema.json`).
 - [ ] **Versioning policy:** additive field/event = minor; rename/remove = major. Consumers
-      negotiate via `protocolVersion` returned from `/api/config` and from the SDK/CLI/MCP handshake.
+      negotiate via `protocolVersion` returned from `/api/config` and from the SDK/MCP handshake.
 - [ ] **Drift test** `tests/test_event_contract.py` — snapshot the event union + each `data`
       key set; fail CI when `runner.py`/`agent.py`/`events.py` add/rename/drop a field without
       a version bump. (Note: `lease`/`live_view` are emitted on the `/ws/view` plane as plain
       dicts, not chat-plane StreamEvents — document this split in the schema.)
-- [ ] Codegen `events.d.ts` (TypeScript) from the JSON Schema for `packages/react` (Group 3).
 
 ### W-C — Cost observability
 
@@ -255,12 +270,10 @@ for SDK `stream()`, CLI `--ndjson`, MCP progress, webhooks, **and** the React em
       counter), and `browser_seconds` (session wall-clock). Add a per-model **price table**
       (`{model_spec: (in_per_mtok, out_per_mtok)}`) → estimated `cost_usd`.
 - [ ] New **`usage` StreamEvent** emitted at turn end (and optional per-step deltas), added to
-      the W-B contract. Surfaced on: SDK `RunResult.usage`, CLI JSON envelope `.usage`,
-      MCP tool-result metadata, Docker webhook payload.
+      the W-B contract. Surfaced on: SDK `RunResult.usage`, MCP tool-result metadata, and the
+      Docker run-poll payload. *(M1: event + token counts landed; `cost_usd` pending the price table.)*
 - [ ] **Budgets:** `CoreConfig.max_steps/max_tokens/max_cost_usd`. Enforce in `runner.run_turn`
-      (check after each step / `AgentRunResultEvent`) → raise `BudgetExceeded`, which unwinds
-      cleanly via the existing `CancelledError` path (releases leases, persists partial). CLI
-      maps it to exit code 4.
+      via `UsageLimits`. *(M1: max_steps/max_tokens landed; max_cost_usd pending the price table.)*
 - [ ] **Optional OpenTelemetry** (extra `[otel]`): a span per turn/step/tool with token/cost
       attributes; no-op when the dep is absent. PydanticAI already integrates with
       OTel/Logfire — wire it through rather than reinvent.
@@ -305,7 +318,7 @@ a `Recorder(store, Null|MemoryArtifacts)`, and a `Runner`.
 class BrowserAgent:
     def __init__(self, *, keys, backend="local", browserbase=None, headless=True,
                  model=None, approve=None, subagents=False, max_concurrent_subagents=1,
-                 max_tabs=6, enforce_byok=True, persist=None, artifacts=None,
+                 max_tabs=6, persist=None, artifacts=None,
                  max_steps=None, max_tokens=None, max_cost_usd=None): ...
     async def __aenter__(self) -> "BrowserAgent": ...      # opens browser session
     async def __aexit__(self, *exc): ...                    # closes + releases (Browserbase too)
@@ -353,23 +366,12 @@ Near-zero code: the tools in `agent.py` are already PydanticAI v2 functions on `
 - [ ] **Approval = MCP elicitation**: `ApprovalRequired`/`DeferredToolRequests` → elicitation
       request; host's callback approves/denies. No elicitation capability → auto-deny (safe).
 - [ ] StreamEvents → MCP **progress notifications**; `usage` (W-C) on the tool result.
-- [ ] Transports: stdio (Claude Desktop default) + Streamable-HTTP/SSE (remote). BYOK via
-      launch-args env → `CoreConfig.server_keys` / `enforce_byok=True`.
-- [ ] `console_scripts: browser-agent-mcp`. Optional `live_view_url` field for Browserbase.
+- [ ] Transports: stdio (Claude Desktop default) + Streamable-HTTP/SSE (remote). Provider
+      keys via launch-args env → passed as the session's keys (no ambient-env fallback).
+- [ ] `console_scripts: agenticbrowser-mcp`. Optional `live_view_url` field for Browserbase.
 
-### 1d — CLI (`agenticbrowser/cli.py`, Typer)
-
-- [ ] Commands: `run <goal|->`, `session new|list|rm`, `replay <run-id>`, `install`.
-- [ ] **Stable exit codes:** 0 done · 2 usage/config · 3 approval-required-and-denied ·
-      4 budget/timeout (W-C) · 5 runtime error · 130 interrupted.
-- [ ] **Output contract:** `--json` (one final envelope `{schema_version, run_id, status, result,
-      steps, approvals, usage, error}`), `--ndjson` (one StreamEvent per line — literal emit
-      serialization), default = pretty TTY.
-- [ ] **Approval policy flags:** `--on-destructive deny|allow|prompt`, `--approve "submit,login"`,
-      `--deny "pay,buy,..."` → drive `ApprovalPolicy` (W-D), answered via `runner.submit_approval`.
-- [ ] `--watch` opens the live-view (screencast/iframe) for human takeover mid-run;
-      `--session <name>` reuses a logged-in `SqliteStore` session; `--browserbase` flips provider.
-- [ ] `pyproject [project.scripts] agenticbrowser = "agenticbrowser.cli:main"`.
+> **CLI (former 1d) — removed.** A standalone TTY/JSON CLI is explicitly out of scope.
+> The SDK + MCP server cover scripting/automation needs.
 
 ---
 
@@ -386,78 +388,52 @@ Ships the full Postgres-backed gateway. Needs W-B (for typed clients) only.
 - [ ] `docker-compose.yml`: `browserbox` + optional bundled `postgres` (volume); document
       "use external managed Postgres for production". `SERVE_UI=true|false` gates the existing
       `app.frontend(...)` mount in `gateway.py` (already single-origin).
-- [ ] New `server/settings.py` fields: `serve_ui`, `webhook_url`, `webhook_secret`.
-- [ ] **Async run + webhook** (reuses the `emit` seam — no core change):
+- [ ] New `server/settings.py` field: `serve_ui`.
+- [ ] **Async run (polling)** (reuses the `emit` seam — no core change):
       `POST /api/chats/{id}/runs` → `{run_id}` (calls existing `runner.start_turn` with an emit
-      that fans out to the WS queue **and** a `server/webhook.py` poster: HMAC-SHA256-signed
-      JSON per StreamEvent, retry+backoff, DLQ); `GET /api/runs/{id}` poll fallback (the
-      Postgres step-trail is the durable record).
-- [ ] **OpenAPI codegen in CI** → `agenticbrowser` (PyPI) + `@agenticbrowser/client` (npm)
-      typed clients, versioned to the image tag. Hand-author the WS framing + StreamEvent union
-      (W-B schema) into the OpenAPI `components` (FastAPI auto-documents REST only); a
-      schema-vs-runtime test guards drift.
+      that fans out to the WS queue and buffers events for poll fallback); `GET /api/runs/{id}`
+      poll (the Postgres step-trail is the durable record). Polling-only; no webhook push.
+- [ ] **OpenAPI codegen in CI** → `agenticbrowser` typed client, versioned to the image tag.
+      Hand-author the WS framing + StreamEvent union (W-B schema) into the OpenAPI `components`
+      (FastAPI auto-documents REST only); a schema-vs-runtime test guards drift.
 - [ ] Volume for `artifacts_dir`; document **single-replica / sticky-session** (in-memory
       registry + leases don't transfer across replicas).
 
 ---
 
-## 6. Group 3 — embeddable widget (`packages/react`; needs NO Phase 0)
+## 6. Embeddable widget — out of scope
 
-Extract the reusable, already-presentational UI; sever the three repo couplings in `api.js`.
-
-**The coupling to break (`frontend/src/api.js`):** `getToken()` reads
-`localStorage['ab_token']` (lines 4-8); `wsUrl()` hardcodes `location.protocol`/`location.host`
-(lines 68-72); same-origin REST in `req()` (line 12).
-
-- [ ] Replace module-level token/host with an `AgentBrowserProvider` React context
-      `{baseUrl, token, fetchToken?}`. `req()`, `wsUrl()`, `artifactUrl()` become context-bound
-      (absolute cross-origin URLs, injected token + refresh). The existing `frontend/` wraps its
-      tree in the provider seeded from localStorage + same-origin → keeps working.
-- [ ] Move into `packages/react/src` (verbatim, only swap `../api.js` imports for context hooks):
-      `chat/{ChatPanel,Composer,ApprovalModal,MiniChat,StepShot,TurnTrail,chatReducer,useChat}`
-      + `live/LivePanel.jsx`. `chatReducer.js`/`useChat.js` are pure → the public state model.
-      **Not** extracted: `App,Workspace,auth,Settings,NewSessionModal` (app-shell);
-      `AuditView` optional behind `capabilities.stepTrail`.
-- [ ] Theme: extract the CSS-custom-property contract (`--bg/--surface/--text/--accent/--agent/
-      --human/--ok/--bad`, `[data-theme=light]`) + a `theme` prop → scoped CSS-var block.
-- [ ] Public API:
-      `<AgentBrowser baseUrl token chatId sessionId layout theme capabilities onEvent
-      onApprovalRequest onTakeover/>`. `onEvent` re-exposes the **same StreamEvent objects**
-      (W-B) the reducer consumes.
-- [ ] **Web component** `<agentic-browser>` (Shadow DOM, Preact/compat to avoid double-React)
-      for Vue/Svelte/Angular/plain HTML.
-- [ ] **iframe embed**: `/embed` route in `gateway.py` (mirrors `app.frontend('/')`); token via
-      `postMessage` (never in URL). `cors_origins` (config) documented as the consumer's origin.
-- [ ] **Short-lived, chat-scoped tokens:** add a token-mint endpoint / `fetchToken` refresh —
-      embeds must NOT carry the long-lived login token (`auth.py` issues long-lived today).
-- [ ] Ship `events.d.ts` from W-B; freeze a `protocolVersion` handshake on `/api/config` so old
-      bundles don't silently drop new events.
-- [ ] Refactor `frontend/` to consume `@agenticbrowser/react` (single source of truth).
+A standalone, embeddable React widget / web component / `<iframe>` embed (`@agenticbrowser/react`,
+an `/embed` route, a `protocolVersion` handshake) is **not** in scope. The existing `frontend/`
+already covers the "ship a UI" need, and no concrete consumer justifies extracting and
+maintaining a separate, cross-origin-embeddable package. If demand appears, the seam is the
+frozen `StreamEvent` contract (W-B) plus decoupling the three `frontend/src/api.js` couplings
+(localStorage token, hardcoded host in `wsUrl()`, same-origin REST in `req()`).
 
 ---
 
 ## 7. Testing & CI
 
 - [ ] Phase-0: `test_store_conformance`, `test_no_env` (§2.4).
-- [ ] W-B: `test_event_contract` drift guard + TS codegen check.
+- [ ] W-B: `test_event_contract` drift guard.
 - [ ] W-C: budget-trip + usage-accounting tests.
 - [ ] W-D: approval-classifier tests (multilingual, unlabeled coord click, spend cap).
 - [ ] Adapter smoke: a real PydanticAI run with `BrowserToolset` against a fixture site.
-- [ ] Group 2: `docker build` + boot + `/api/health` + one webhook delivery in CI.
-- [ ] Group 3: build `packages/react`, render `<AgentBrowser>` against a mock WS.
+- [ ] Group 2: `docker build` + boot + `/api/health` + a `/runs` poll round-trip in CI.
 - [ ] Reuse `evals.py` (`pydantic_evals`) as a regression gate on agent capability.
 
 ---
 
 ## 8. Risks & open decisions
 
-- **Package rename touches deploy** (`main.py`, `pyproject [tool.fastapi]`, `.fastapicloud/`,
-  `run.sh`) — do it at M0 before more files accrete; verify a FastAPI Cloud deploy after.
-- **Playwright ↔ Chromium version skew** on the `pip` path — pin Playwright and document the
+- **Deploy** is **Docker / local self-host only**; the package rename touched `main.py` +
+  `run.sh`, handled at M0. `main.py` stays a generic `main:app` ASGI shim.
+- **Playwright ↔ Chromium version skew** on the `uv add` path — pin Playwright and document the
   matching `playwright install`; the Docker image avoids this by baking the matched pair.
 - **Sandboxing (decided to flag, not solve here):** any headless embed runs a real browser
   visiting attacker pages next to app secrets. Recommend (and document) containerized Chromium /
-  network-namespace for untrusted targets; default `enforce_byok` keeps server keys out.
+  network-namespace for untrusted targets; the SDK uses only the keys you pass it (no
+  ambient-env fallback), so a stray host env key stays out of the agent.
 - **Prompt-injection / SSRF:** add an egress allowlist hook at the session layer (every backend
   embed, not just the dropped SaaS) — track as a fast-follow to W-D.
 - **Price table maintenance (W-C):** model prices drift; keep the table data-only and
@@ -467,14 +443,136 @@ Extract the reusable, already-presentational UI; sever the three repo couplings 
 
 ---
 
-## 9. Suggested first PR (M0 slice)
+## 9. First PR (M0 slice) — ✅ DONE
 
-1. Add `LICENSE`/`NOTICE` + `pyproject` license metadata (W-A).
-2. Package rename `app/` → `agenticbrowser/` (+ `server/` submodule) with deploy shim.
-3. `CoreConfig` + thread the 14 `settings()` call sites; `Settings.to_core_config()`.
-4. `Store` Protocol + `MemoryStore` + `SqliteStore`; `Null/MemoryArtifacts`.
-5. Injectable `enforce_byok`/`server_keys` in `models_registry` (the BYOK correctness fix).
-6. `events.py` + `EVENT_SCHEMA_VERSION` + `test_event_contract` (W-B foundation).
-7. Conformance + no-env tests green.
+- [x] Add `LICENSE` (Apache-2.0) + `NOTICE` + `pyproject` license metadata, classifiers,
+      and optional-dependency extras `[server] [evals] [otel] [dev]` (W-A).
+- [x] Package rename `app/` → `agenticbrowser/` (+ `server/` submodule) via `git mv`
+      (history preserved); deploy shim updated (`main.py`, `run.sh`).
+- [x] `CoreConfig` (`agenticbrowser/config.py`) + threaded all 14 `settings()` call sites
+      in agent/providers/registry/session/models_registry; `Settings.to_core_config()` in
+      `server/settings.py` is the one producer for the gateway.
+- [x] `Store` Protocol + `MemoryStore` + `SqliteStore(WAL)` (`agenticbrowser/stores.py`);
+      `ArtifactStore` + `Local/Null/MemoryArtifacts` (`agenticbrowser/artifacts.py`).
+- [x] Injectable `provider_keys` in `models_registry` — the key-resolution correctness fix
+      (keys come ONLY from `cfg.provider_keys`; no per-session key, no ambient `os.environ`
+      fallback, so a stray env key can never leak in).
+- [x] `events.py` + `EVENT_SCHEMA_VERSION="1.0"` + typed `EVENT_DATA_KEYS`; `StreamEvent`
+      re-exported from `models.py` for back-compat.
+- [x] Tests green: `tests/test_store_conformance.py` (Memory vs SQLite identical),
+      `tests/test_no_env_keys.py`, `tests/test_event_contract.py`.
 
-That single PR makes the project genuinely embeddable and is the gate for everything after.
+### Implementation notes / deviations from the original plan
+
+- **SQL store class kept named `Store`** (in `server/store_sql.py`), not `SqlStore` —
+  the Protocol is `Store` in `stores.py`; the concrete SQL class is `Store` in
+  `server/store_sql.py`. They live in different modules and never collide, so
+  gateway/auth/evals keep `from .store_sql import Store` with zero annotation churn.
+  (Lower-risk than the planned rename; revisit only if it confuses contributors.)
+- **No `[build-system]` block yet** — dev runs via `PYTHONPATH` (unchanged). Real
+  installability (build backend + wheel) is deferred to M1 with the SDK.
+- **Import-time prompt fix:** `ORCHESTRATOR_PROMPT` no longer interpolates
+  `settings()`; an `@agent.system_prompt` dynamic function injects the concrete
+  sub-agent/tab limits from `ctx.deps.cfg` per run.
+- **`usage` event forward-declared** in the W-B contract now (type + data keys) so the
+  schema is stable before W-C actually emits it.
+- **Server env-key push retained** in `server/settings.py.settings()` (os.environ
+  setdefault) so PydanticAI's env-based resolution finds the server's `.env` keys; this is
+  server-only — the core never reads `os.environ`.
+- **Conformance test scope:** exercises the 11-method Store surface directly on both
+  impls (fast, no browser). A full stub-provider end-to-end agent run is a later add.
+- `server/evals.py` threaded with `CoreConfig()` to keep it importable/correct (dev-only).
+
+This makes the project genuinely embeddable and is the gate for everything after.
+
+---
+
+## 10. M1 — SDK + PydanticAI adapter — ✅ DONE
+
+- [x] **`BrowserAgent` SDK** (`agenticbrowser/sdk.py`) — async context manager over the
+      existing `Runner`. `run(goal) -> RunResult`, `stream(goal)` (async iterator),
+      `approve=` callback (auto-deny default), `persist=` (MemoryStore /
+      `sqlite:///path` / custom Store), `subagents=`, `max_steps/max_tokens`,
+      `backend="local"|"browserbase"`, `export_messages()`. Internally mints
+      session/chat ids, builds MemoryStore/SqliteStore + `MemoryArtifacts` + a
+      single-session registry, and drives `Runner.run_turn`.
+- [x] **Approval bridge** — `approval_request` events are resolved via the user's
+      `approve=` handler in a deferred task (so `Runner._collect`'s future is
+      registered first) and fed back through `runner.submit_approval`. Returns
+      `Approval` / `True` / `str`; omitted ⇒ auto-deny (fail-safe).
+- [x] **Usage event + budgets (W-C foundation)** — `runner.py` accumulates
+      `result.usage()` across a turn's segments, emits a `usage` StreamEvent
+      (`steps/requests/input_tokens/output_tokens/total_tokens/cost_usd`), and
+      applies `UsageLimits(request_limit=None, tool_calls_limit=max_steps,
+      total_tokens_limit=max_tokens)`; `UsageLimitExceeded` → clean "Budget exceeded".
+- [x] **PydanticAI adapter** (`agenticbrowser/adapters/pydantic_ai.py`) —
+      `EphemeralBrowser` (long-lived session) + `as_tool()` and `browse_task_tool()`
+      exposing a `browse_task(goal)` tool for any PydanticAI `Agent`.
+- [x] **`agenticbrowser-install`** console-script (`agenticbrowser/install.py`) +
+      `[project.scripts]`; the SDK raises a clear "run install / use browserbase"
+      error if Chromium is missing.
+- [x] **Exports** updated in `agenticbrowser/__init__.py` (BrowserAgent, RunResult,
+      Approval, ApprovalRequest).
+- [x] **Tests** (19/19): `tests/test_sdk.py` (config/store/approval units + two
+      **real-Chromium** E2E: navigate→finish, destructive-click→auto-deny→resume),
+      `tests/test_adapter_pydantic_ai.py`. E2E uses a scripted `FunctionModel`
+      `stream_function` (no LLM key/network) via `agent.override(model=...)`.
+- [x] **Docs** — [docs/sdk.md](docs/sdk.md) quickstart.
+
+### Deviations from the original §4 plan
+
+- **PydanticAI adapter ships the high-level `browse_task` tool, not the fine-grained
+  13-tool `BrowserToolset`.** The low-level tools are bound to `RunContext[AgentDeps]`
+  (and `ctx.usage`); exposing them in a *host's* run needs RunContext bridging so
+  approvals propagate as native `DeferredToolRequests`. Deferred — `browse_task`
+  (one autonomous call, approvals handled inside via `approve=`) is the robust M1
+  shape and is also exactly what the M2 MCP server will reuse.
+- **`live_view()` / `takeover()` / `send_input()` and mid-run `steer()` are deferred.**
+  Multi-turn already works by calling `run()`/`stream()` again (history accumulates
+  under one chat id). The interactive human-takeover surface lands in a later piece.
+- **Cost in `$` is not yet computed** — the `usage` event carries token counts;
+  `cost_usd` is `None` until the W-C price table + OTel spans land. `max_cost_usd` is
+  accepted but not yet enforced (token/step budgets are).
+- **W-D (approval-gate v2) not started** — the SDK exposes the *existing* regex gate
+  via `approve=`. Improving the classifier (multilingual verbs, unlabeled-click
+  fail-closed, URL allow/deny, spend ceiling) is the next focused piece.
+
+---
+
+## 11. M2–M3 — MCP + Docker — ✅ DONE
+
+### M2 — MCP server (Group 1c)
+- [x] `agenticbrowser/mcp/server.py` (FastMCP). Tools: `browse_task(goal, session_id="")`,
+      `open_session`, `close_session`, `list_sessions`. Reuses the `BrowserAgent` SDK;
+      persistent sessions kept in a module dict for cross-call reuse.
+- [x] **Approval = MCP elicitation** (`_make_approver`): asks the host via `ctx.elicit`;
+      falls back to auto-deny (or `BROWSER_AGENT_AUTO_APPROVE=true`) when the host can't.
+- [x] provider keys + config via env; transports `stdio`/`sse`/`streamable-http`
+      (`BROWSER_AGENT_MCP_TRANSPORT`). `[mcp]` extra + `agenticbrowser-mcp` console script.
+- [x] 7 tests (`tests/test_mcp.py`): tool registration + the elicitation bridge. Docs:
+      [docs/mcp.md](docs/mcp.md).
+- Deviation: low-level tools (`--expose-low-level`) and Browserbase `live_view_url` are
+  deferred; `browse_task` (one autonomous call) is the shape shipped.
+
+### M3 — Docker self-host (Group 2)
+- [x] Multi-stage **`infra/Dockerfile`** (node build of `frontend/` → Playwright python
+      runtime, runs from `/app` source so `ROOT=/app`) + **`.dockerignore`** (at the repo
+      root, the build-context root).
+- [x] **`infra/docker-compose.yml`**: `app` + healthchecked `postgres`; `shm_size: 1gb`;
+      env-driven (`SERVE_UI`, provider keys, bootstrap, …); `build.context: ..` so COPY
+      paths stay repo-root-relative. `infra/run.sh` starts only the `postgres` service for
+      local dev.
+- [x] **`infra/` + root `Makefile`**: all Docker/bash ops live under `infra/`; the
+      `Makefile` wraps them (`make up`/`run`/`dev`/`down`/`db`/`config`).
+- [x] `server/settings.py`: `serve_ui`; the UI mount is gated on it.
+- [x] **Fire-and-forget runs (polling)** (no core change — rides `emit`): `POST
+      /api/chats/{id}/runs` → `{run_id}`, `GET /api/runs/{id}`, `POST
+      /api/runs/{id}/approvals`, `POST /api/runs/{id}/stop`. (Polling-only; no webhook push.)
+- [x] **`[build-system]` (hatchling)** added — the package builds a wheel (verified), which
+      the Docker `uv pip install ".[server,mcp]"` step uses, and enables installing from
+      GitHub (`uv add "git+https://github.com/CharbelDaher34/agentic-browser.git"`).
+- [x] Verified: wheel builds, `docker compose -f infra/docker-compose.yml config` valid,
+      gateway exposes the run routes.
+      Docs: [docs/self-host.md](docs/self-host.md).
+- Deviation: the **image itself was not built here** (heavy Playwright base); the
+  Dockerfile is verified by the wheel build + compose validation.

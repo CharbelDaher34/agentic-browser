@@ -19,7 +19,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
-from .config import settings
+from .config import CoreConfig
 from .models import Action, ActionKind, ActionResult, Element, PageObservation
 from .providers import OpenBrowser
 
@@ -83,8 +83,9 @@ class _Tab:
 
 
 class PlaywrightSession:
-    def __init__(self, ob: OpenBrowser) -> None:
+    def __init__(self, ob: OpenBrowser, cfg: CoreConfig) -> None:
         self._ob = ob
+        self._cfg = cfg
         self._context = ob.context
         self._tabs: dict[str, _Tab] = {}
         self._primary = "t0"
@@ -154,9 +155,10 @@ class PlaywrightSession:
 
     @classmethod
     async def open(
-        cls, provider, storage_state: dict | None = None, *, reconnect_id: str | None = None
+        cls, provider, storage_state: dict | None = None, *,
+        cfg: CoreConfig, reconnect_id: str | None = None,
     ) -> "PlaywrightSession":
-        self = cls(await provider.open(storage_state, reconnect_id=reconnect_id))
+        self = cls(await provider.open(storage_state, reconnect_id=reconnect_id), cfg)
         t0 = _Tab(self._primary, self._ob.page, self._ob.cdp, label="main")
         self._tabs[self._primary] = t0
         # New tabs/popups are ADOPTED as real tabs (multi-tab model). Listening at
@@ -390,7 +392,7 @@ class PlaywrightSession:
         on repaint, so a viewer of a static page would otherwise see nothing)."""
         try:
             data = await self._tab(tab_id).page.screenshot(
-                type="jpeg", quality=settings().screencast_quality
+                type="jpeg", quality=self._cfg.screencast_quality
             )
         except Exception:  # noqa: BLE001
             return None
@@ -405,7 +407,7 @@ class PlaywrightSession:
         if tab.streaming or tab.cdp is None:
             return
         tab.streaming = True
-        s = settings()
+        s = self._cfg
         params: dict = {
             "format": "jpeg",
             "quality": s.screencast_quality,

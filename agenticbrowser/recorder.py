@@ -10,29 +10,10 @@ together with the message history this is your full replay trail.
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
-from typing import Protocol
 
+from .artifacts import ArtifactStore
 from .models import Action, ActionResult, StepRecord
-from .store import Store
-
-
-class ArtifactStore(Protocol):
-    async def put_png(self, key: str, data: bytes) -> str: ...
-
-
-class LocalArtifacts:
-    def __init__(self, root: str = "artifacts") -> None:
-        self._root = Path(root)
-        self._root.mkdir(parents=True, exist_ok=True)
-
-    async def put_png(self, key: str, data: bytes) -> str:
-        path = self._root / f"{key}.png"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        # web path served by the gateway's authenticated /api/artifacts route
-        # (key is "<chat_id>/<idx>-<hash>"); ownership is checked on fetch.
-        return f"/api/artifacts/{key}.png"
+from .stores import Store
 
 
 class Recorder:

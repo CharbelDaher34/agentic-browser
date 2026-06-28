@@ -46,9 +46,9 @@ app/
 ## Install
 
 ```bash
-pip install "pydantic-ai-slim[anthropic]>=2,<3" "pydantic-evals>=2,<3" \
-            playwright "fastapi" "uvicorn[standard]" asyncpg "--pre browserbase"
-playwright install chromium
+uv add "pydantic-ai-slim[anthropic]>=2,<3" "pydantic-evals>=2,<3" \
+       playwright "fastapi" "uvicorn[standard]" asyncpg --prerelease=allow browserbase
+uv run playwright install chromium
 export ANTHROPIC_API_KEY=sk-ant-...
 export DATABASE_URL=postgresql://user:pass@localhost/agent
 export BROWSER_PROVIDER=local            # or: browserbase

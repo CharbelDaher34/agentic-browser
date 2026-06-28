@@ -37,11 +37,8 @@ export const api = {
   me: () => req('GET', '/api/auth/me'),
   logout: () => req('POST', '/api/auth/logout'),
 
-  // what the UI must ask for (browser provider + whether BYOK creds are required)
-  appConfig: () => req('GET', '/api/config'),
-
   listSessions: () => req('GET', '/api/sessions'),
-  // opts: { name, provider?, browserbase?: {api_key, project_id}, keys?: {provider: key} }
+  // opts: { name, provider? }  — keys come from the server's env, not per session
   createSession: (opts) => req('POST', '/api/sessions', opts),
   sessionDetail: (sid) => req('GET', `/api/sessions/${sid}`),
 
@@ -51,17 +48,6 @@ export const api = {
     req('POST', '/api/chats', { session_id, title }),
   chatMessages: (cid) => req('GET', `/api/chats/${cid}/messages`),
   chatSteps: (cid) => req('GET', `/api/chats/${cid}/steps`),
-
-  // BYOK keys — scoped to a browser session (purged when the session is reaped)
-  sessionKeys: (sid) => req('GET', `/api/sessions/${sid}/keys`),
-  saveSessionKey: (sid, provider, key) =>
-    req('PUT', `/api/sessions/${sid}/keys/${provider}`, { key }),
-  deleteSessionKey: (sid, provider) =>
-    req('DELETE', `/api/sessions/${sid}/keys/${provider}`),
-  saveSessionBrowserbase: (sid, api_key, project_id) =>
-    req('PUT', `/api/sessions/${sid}/browserbase`, { api_key, project_id }),
-  deleteSessionBrowserbase: (sid) =>
-    req('DELETE', `/api/sessions/${sid}/browserbase`),
 }
 
 // Build a same-origin WebSocket URL (works through the Vite proxy and in prod).

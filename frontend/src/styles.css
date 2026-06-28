@@ -223,6 +223,28 @@ input, textarea { font-family: inherit; }
   font-size: 11px; font-weight: 600; color: var(--text-dim);
   border: 1px solid var(--border); border-radius: 99px; padding: 3px 9px;
 }
+/* per-message usage footer under an assistant message */
+.usage-line {
+  margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--border);
+  font-size: 11px; color: var(--text-faint); font-family: 'JetBrains Mono', monospace;
+}
+.usage-line strong { color: var(--text-dim); font-weight: 700; }
+
+/* session usage total — a block in the sidebar (above the user/sign-out foot) */
+.session-usage {
+  border-top: 1px solid var(--border); padding: 10px 12px;
+  font-family: 'JetBrains Mono', monospace;
+}
+.session-usage-h {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
+  color: var(--text-faint); margin-bottom: 5px;
+}
+.session-usage-row {
+  display: flex; align-items: baseline; gap: 7px;
+  font-size: 13px; font-weight: 700; color: var(--text);
+}
+.session-usage-row .su-cost { color: var(--accent); }
+.session-usage-sub { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
 
 /* ============================================================================
    Chat
@@ -397,13 +419,6 @@ input, textarea { font-family: inherit; }
 .approval-call { font-family: 'JetBrains Mono', monospace; font-size: 12px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 9px; padding: 9px 11px; margin-bottom: 8px; word-break: break-word; }
 .approval-call b { color: var(--bad); }
 .modal-foot { padding: 12px 18px 16px; display: flex; gap: 10px; justify-content: flex-end; }
-
-/* ---- BYOK key rows (Settings modal) -------------------------------------- */
-.key-row { padding: 10px 0; border-bottom: 1px solid var(--border); }
-.key-row:last-child { border-bottom: none; }
-.key-row-h { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
-.key-label { font-weight: 600; font-size: 13px; }
-.key-set { font-size: 11px; color: var(--ok); font-weight: 600; }
 
 /* ============================================================================
    Live view

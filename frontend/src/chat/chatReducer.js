@@ -4,11 +4,31 @@
 // visible after the turn ends and matches what reload reconstructs.
 
 export const initialChat = {
-  messages: [],     // committed: {role, text} | {role:'assistant', items[], subagents[], interrupted}
+  messages: [],     // committed: {role, text} | {role:'assistant', items[], subagents[], interrupted, usage?}
   live: [],         // current-turn main trail items
   subagents: [],    // [{id, tab, task, model, status, ok, result, last}]
   running: false,
   approval: null,   // {calls:[{id,tool,args}]}
+  turnUsage: null,  // usage event for the in-flight turn (embedded into the message on commit)
+}
+
+// The session total is DERIVED from the usage embedded in committed messages —
+// there is no separately-tracked accumulator. See sumUsage() (exported) which the
+// sidebar uses to total whatever messages are loaded.
+export function sumUsage(messages) {
+  const t = { steps: 0, requests: 0, input_tokens: 0, output_tokens: 0, total_tokens: 0, cost_usd: null, turns: 0 }
+  for (const m of messages || []) {
+    const u = m.usage
+    if (!u) continue
+    t.steps += u.steps || 0
+    t.requests += u.requests || 0
+    t.input_tokens += u.input_tokens || 0
+    t.output_tokens += u.output_tokens || 0
+    t.total_tokens += u.total_tokens || 0
+    if (u.cost_usd != null) t.cost_usd = (t.cost_usd || 0) + u.cost_usd
+    t.turns += 1
+  }
+  return t
 }
 
 const isSub = (d) => typeof d?.agent === 'string' && d.agent.startsWith('sub:')
@@ -39,15 +59,20 @@ function buildAssistant(state, finalText, interrupted) {
     if (idx >= 0) items[idx] = { ...items[idx], text: finalText }
     else items = [...items, { kind: 'text', text: finalText }]
   }
-  return { role: 'assistant', items, subagents: state.subagents, interrupted }
+  return { role: 'assistant', items, subagents: state.subagents, interrupted, usage: state.turnUsage }
 }
 
 function commit(state, finalText, interrupted) {
   const hasContent = state.live.length || state.subagents.length || finalText
+  // the turn's usage is embedded into the committed assistant message (buildAssistant);
+  // the session total is derived from messages, so nothing else to track here.
   const messages = hasContent
     ? [...state.messages, buildAssistant(state, finalText, interrupted)]
     : state.messages
-  return { ...state, messages, live: [], subagents: [], running: false, approval: null }
+  return {
+    ...state, messages,
+    live: [], subagents: [], running: false, approval: null, turnUsage: null,
+  }
 }
 
 export function chatReducer(state, action) {
@@ -64,7 +89,7 @@ export function chatReducer(state, action) {
     return {
       ...base,
       messages: [...base.messages, { role: 'user', text: action.text }],
-      live: [], subagents: [], running: true, approval: null,
+      live: [], subagents: [], running: true, approval: null, turnUsage: null,
     }
   }
   if (action.type === 'connecting') {
@@ -101,6 +126,10 @@ export function chatReducer(state, action) {
       return { ...state, subagents: [...state.subagents, { id: d.id, tab: d.tab, task: d.task, model: d.model, status: 'running', last: '' }] }
     case 'subagent_end':
       return { ...state, subagents: state.subagents.map((s) => (s.id === d.id ? { ...s, status: 'done', ok: d.ok, result: d.result } : s)) }
+    case 'usage':
+      // emitted just before `final`; stash it so commit() can attach it to the
+      // assistant message and roll it into the session total.
+      return { ...state, turnUsage: d }
     case 'approval_request':
       return { ...state, approval: d }
     case 'final':

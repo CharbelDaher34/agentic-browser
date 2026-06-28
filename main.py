@@ -1,7 +1,9 @@
-"""Entrypoint shim for the FastAPI CLI (`fastapi deploy` / `fastapi run`).
+# SPDX-License-Identifier: Apache-2.0
+"""Top-level ASGI entrypoint shim — re-exports the gateway app as `main:app`.
 
-The real ASGI app lives in `app/gateway.py`; the CLI auto-detects an `app`
-object in a top-level module, so we just re-export it here.
+The real app lives in `agenticbrowser/server/gateway.py`. `infra/run.sh` and the
+Docker image run `agenticbrowser.server.gateway:app` directly; this shim just lets
+`uvicorn main:app` work too.
 """
 
-from app.gateway import app  # noqa: F401
+from agenticbrowser.server.gateway import app  # noqa: F401

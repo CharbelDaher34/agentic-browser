@@ -46,13 +46,13 @@ from .auth import (
     user_for_ws,
     verify_password,
 )
-from .config import ROOT, settings
-from .models import ProviderName, StreamEvent
-from .models_registry import KEY_PROVIDERS
-from .recorder import LocalArtifacts, Recorder
-from .registry import SessionRegistry
-from .runner import Runner
-from .store import Store
+from ..artifacts import LocalArtifacts
+from ..models import ProviderName, StreamEvent
+from ..recorder import Recorder
+from ..registry import SessionRegistry
+from ..runner import Runner
+from .settings import ROOT, settings
+from .store_sql import Store
 
 
 async def _bootstrap_user(store: Store) -> None:
@@ -80,14 +80,17 @@ async def _bootstrap_user(store: Store) -> None:
 async def lifespan(app: FastAPI):
     store = await Store.connect(settings().database_url)
     await _bootstrap_user(store)
-    registry = SessionRegistry(store)
+    cfg = settings().to_core_config()
+    registry = SessionRegistry(store, cfg)
     recorder = Recorder(store, LocalArtifacts(settings().artifacts_dir))
-    runner = Runner(registry, store, recorder)
+    runner = Runner(registry, store, recorder, cfg)
     app.state.store = store
     app.state.registry = registry
     app.state.recorder = recorder
     app.state.runner = runner
     app.state.tasks = set()   # keep refs to fire-and-forget run_turn tasks
+    app.state.runs = {}       # run_id -> state for REST fire-and-forget runs
+    app.state.run_tasks = {}  # run_id -> driver task (for POST /runs/{id}/stop)
 
     async def reaper():
         while True:
@@ -122,23 +125,9 @@ class Credentials(BaseModel):
     password: str
 
 
-class ApiKeyIn(BaseModel):
-    key: str
-
-
-class BrowserbaseCreds(BaseModel):
-    api_key: str
-    project_id: str
-
-
 class CreateSession(BaseModel):
     name: str | None = None
     provider: ProviderName | None = None
-    # per-session BYOK: provided by web users at creation. browserbase is required
-    # to open a cloud browser (unless the server env supplies a fallback); the LLM
-    # keys are optional (fall back to the server env).
-    browserbase: BrowserbaseCreds | None = None
-    keys: dict[str, str] | None = None   # {anthropic|openai|google: api_key}
 
 
 class CreateChat(BaseModel):
@@ -201,9 +190,9 @@ async def logout(
 
 # --- app config (public-ish: tells the UI what to ask for) -------------------
 def _server_browserbase() -> bool:
-    """True if the server has a usable Browserbase fallback (off under enforce_byok)."""
+    """True if the server has Browserbase creds configured (from its env)."""
     s = settings()
-    return bool(s.browserbase_api_key and s.browserbase_project_id) and not s.enforce_byok
+    return bool(s.browserbase_api_key and s.browserbase_project_id)
 
 
 @app.get("/api/config")
@@ -211,76 +200,9 @@ async def app_config():
     s = settings()
     return {
         "browser_provider": s.browser_provider,
-        # web users must supply Browserbase creds at session creation unless the
-        # server provides a fallback (a developer running locally with env keys).
+        # only true if the server is misconfigured (browserbase provider, no creds)
         "browserbase_required": s.browser_provider == "browserbase" and not _server_browserbase(),
-        # when true, server LLM keys are disabled too, so model keys are required
-        "enforce_byok": s.enforce_byok,
-        "key_providers": sorted(KEY_PROVIDERS),
     }
-
-
-# --- BYOK: per-SESSION keys (purged when the session is reaped) --------------
-async def _own_session_or_404(session_id: str, user_id: str) -> Store:
-    store: Store = app.state.store
-    if await store.session_owner(session_id) != user_id:
-        raise HTTPException(404, "Session not found")
-    return store
-
-
-@app.get("/api/sessions/{session_id}/keys")
-async def list_session_keys(session_id: str, user: dict = Depends(current_user)):
-    store = await _own_session_or_404(session_id, user["user_id"])
-    have = set(await store.list_session_key_providers(session_id))
-    # report which providers are set (never return the keys themselves)
-    return {
-        "providers": {p: (p in have) for p in sorted(KEY_PROVIDERS)},
-        "browserbase": "browserbase" in have,
-    }
-
-
-@app.put("/api/sessions/{session_id}/keys/{provider}")
-async def set_session_key(
-    session_id: str, provider: str, body: ApiKeyIn, user: dict = Depends(current_user)
-):
-    if provider not in KEY_PROVIDERS:
-        raise HTTPException(400, "Unknown provider")
-    store = await _own_session_or_404(session_id, user["user_id"])
-    key = (body.key or "").strip()
-    if not key:
-        raise HTTPException(400, "Empty key")
-    await store.save_session_key(session_id, provider, key)
-    return {"ok": True}
-
-
-@app.delete("/api/sessions/{session_id}/keys/{provider}")
-async def delete_session_key(
-    session_id: str, provider: str, user: dict = Depends(current_user)
-):
-    store = await _own_session_or_404(session_id, user["user_id"])
-    await store.delete_session_key(session_id, provider)
-    return {"ok": True}
-
-
-@app.put("/api/sessions/{session_id}/browserbase")
-async def set_session_browserbase(
-    session_id: str, body: BrowserbaseCreds, user: dict = Depends(current_user)
-):
-    store = await _own_session_or_404(session_id, user["user_id"])
-    api_key, project_id = body.api_key.strip(), body.project_id.strip()
-    if not (api_key and project_id):
-        raise HTTPException(400, "Both API key and project ID are required")
-    await store.save_session_browserbase_creds(session_id, api_key, project_id)
-    return {"ok": True}
-
-
-@app.delete("/api/sessions/{session_id}/browserbase")
-async def delete_session_browserbase(
-    session_id: str, user: dict = Depends(current_user)
-):
-    store = await _own_session_or_404(session_id, user["user_id"])
-    await store.delete_session_key(session_id, "browserbase")
-    return {"ok": True}
 
 
 # --- browser sessions --------------------------------------------------------
@@ -290,30 +212,18 @@ async def create_session(body: CreateSession, user: dict = Depends(current_user)
     registry: SessionRegistry = app.state.registry
     s = settings()
     provider = body.provider or s.browser_provider
-    # browserbase needs creds up front (session-supplied, else a server fallback)
-    if provider == "browserbase":
-        if not body.browserbase and not _server_browserbase():
-            raise HTTPException(
-                400, "Add your Browserbase API key and project ID to open a cloud browser."
-            )
+    if provider == "browserbase" and not _server_browserbase():
+        raise HTTPException(
+            400, "Browserbase isn't configured — set BROWSERBASE_API_KEY and "
+            "BROWSERBASE_PROJECT_ID on the server.",
+        )
 
     session_id = "s_" + uuid.uuid4().hex[:12]
     name = body.name or f"session-{session_id[2:8]}"
     await store.create_session(session_id, user["user_id"], name, provider)
-    # stash this session's BYOK keys BEFORE opening the browser
-    if body.browserbase:
-        await store.save_session_browserbase_creds(
-            session_id, body.browserbase.api_key.strip(), body.browserbase.project_id.strip()
-        )
-    for prov, key in (body.keys or {}).items():
-        if prov in KEY_PROVIDERS and (key or "").strip():
-            await store.save_session_key(session_id, prov, key.strip())
-
     try:
         await registry.create(session_id, provider)  # opens the browser now
     except Exception as exc:  # noqa: BLE001
-        # don't retain keys for a session that never opened
-        await store.delete_session_keys(session_id)
         msg = str(exc)
         if "Browserbase credentials" in msg:
             raise HTTPException(400, msg)
@@ -391,11 +301,11 @@ async def chat_messages(chat_id: str, user: dict = Depends(current_user)):
 
 
 @app.get("/api/chats/{chat_id}/steps")
-async def chat_steps(chat_id: str, user: dict = Depends(current_user)):
+async def chat_steps(chat_id: str, since: int = 0, user: dict = Depends(current_user)):
     store: Store = app.state.store
     if await store.chat_owner(chat_id) != user["user_id"]:
         raise HTTPException(404, "Chat not found")
-    return {"steps": await store.list_steps(chat_id)}
+    return {"steps": await store.list_steps(chat_id, since)}
 
 
 @app.get("/api/artifacts/{chat_id}/{filename}")
@@ -425,6 +335,104 @@ async def get_artifact(
 
 @app.get("/api/health")
 async def health():
+    return {"ok": True}
+
+
+# --- fire-and-forget runs (self-host service; poll GET /api/runs/{id}) --------
+class RunIn(BaseModel):
+    text: str
+
+
+class RunApproval(BaseModel):
+    decisions: dict
+
+
+@app.post("/api/chats/{chat_id}/runs")
+async def start_run(chat_id: str, body: RunIn, user: dict = Depends(current_user)):
+    """Start a turn fire-and-forget; returns {run_id}. Poll progress/result via
+    GET /api/runs/{run_id}; approve a paused destructive action via
+    POST /api/runs/{run_id}/approvals; cancel via POST /api/runs/{run_id}/stop."""
+    store: Store = app.state.store
+    runner: Runner = app.state.runner
+    if await store.chat_owner(chat_id) != user["user_id"]:
+        raise HTTPException(404, "Chat not found")
+    session_id = await store.session_of(chat_id)
+    if not session_id:
+        raise HTTPException(404, "Chat has no session")
+    run_id = "run_" + uuid.uuid4().hex[:12]
+    state = {
+        "run_id": run_id, "chat_id": chat_id, "status": "running",
+        "output": None, "usage": None, "error": None, "events": 0,
+    }
+    runs = app.state.runs
+    if len(runs) > 2000:  # bound memory: evict oldest TERMINAL runs only (never a live/paused one)
+        terminal = [rid for rid, st in runs.items()
+                    if st["status"] in ("succeeded", "failed", "cancelled")]
+        for old in terminal[: len(runs) - 2000]:
+            runs.pop(old, None)
+    runs[run_id] = state
+
+    async def emit(ev: StreamEvent) -> None:
+        state["events"] += 1
+        if ev.type == "final":
+            state["output"] = ev.data.get("text")
+        elif ev.type == "usage":
+            state["usage"] = dict(ev.data)
+        elif ev.type == "error":
+            state["error"] = ev.data.get("msg")
+
+    async def driver() -> None:
+        try:
+            await runner.run_turn(session_id, chat_id, body.text, emit, user["user_id"])
+            state["status"] = "failed" if state["error"] else "succeeded"
+        except asyncio.CancelledError:
+            state["status"] = "cancelled"  # POST /runs/{id}/stop unwinds run_turn cleanly
+            raise
+        except Exception as exc:  # noqa: BLE001
+            state["status"], state["error"] = "failed", str(exc)
+        finally:
+            app.state.run_tasks.pop(run_id, None)
+
+    task = asyncio.create_task(driver())
+    app.state.run_tasks[run_id] = task
+    app.state.tasks.add(task)
+    task.add_done_callback(app.state.tasks.discard)
+    return {"run_id": run_id, "status": "running"}
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str, user: dict = Depends(current_user)):
+    state = app.state.runs.get(run_id)
+    store: Store = app.state.store
+    if not state or await store.chat_owner(state["chat_id"]) != user["user_id"]:
+        raise HTTPException(404, "Run not found")
+    return state
+
+
+@app.post("/api/runs/{run_id}/approvals")
+async def approve_run(run_id: str, body: RunApproval, user: dict = Depends(current_user)):
+    """Resolve a run paused on a destructive action (seen via GET /api/runs/{id}
+    as an `approval_request`). decisions: {tool_call_id: true | "deny reason"}."""
+    state = app.state.runs.get(run_id)
+    store: Store = app.state.store
+    runner: Runner = app.state.runner
+    if not state or await store.chat_owner(state["chat_id"]) != user["user_id"]:
+        raise HTTPException(404, "Run not found")
+    await runner.submit_approval(state["chat_id"], body.decisions)
+    return {"ok": True}
+
+
+@app.post("/api/runs/{run_id}/stop")
+async def stop_run(run_id: str, user: dict = Depends(current_user)):
+    """Cancel a fire-and-forget run; run_turn unwinds cleanly (releases its lease,
+    persists partial context). Status becomes 'cancelled'."""
+    state = app.state.runs.get(run_id)
+    store: Store = app.state.store
+    if not state or await store.chat_owner(state["chat_id"]) != user["user_id"]:
+        raise HTTPException(404, "Run not found")
+    task = app.state.run_tasks.get(run_id)
+    if task and not task.done():
+        task.cancel()
     return {"ok": True}
 
 
@@ -461,7 +469,7 @@ async def chat_ws(ws: WebSocket, chat_id: str):
         while True:
             ev = await send_q.get()
             try:
-                await ws.send_text(json.dumps({"type": ev.type, "data": dict(ev.data)}))
+                await ws.send_text(json.dumps(ev.wire()))
             except Exception:  # noqa: BLE001 — client went away mid-stream
                 break
             finally:
@@ -640,7 +648,8 @@ async def view_ws(ws: WebSocket, session_id: str):
 # /api and /ws routes above are matched first; unknown browser paths fall back to
 # index.html (SPA routing). Build it with `cd frontend && npm run build`.
 _DIST = ROOT / "frontend" / "dist"
-if _DIST.is_dir():
+if settings().serve_ui and _DIST.is_dir():
     # fallback="auto": serve index.html for browser-navigation requests (SPA
     # routing) but let unmatched /api/* fetches return a real 404, not HTML.
+    # SERVE_UI=false → pure API deployment (no bundled UI).
     app.frontend("/", directory=str(_DIST), fallback="auto")

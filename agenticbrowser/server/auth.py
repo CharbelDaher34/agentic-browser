@@ -16,8 +16,8 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Header, HTTPException, Request
 
-from .config import settings
-from .store import Store
+from .settings import settings
+from .store_sql import Store
 
 _ITERATIONS = 200_000
 

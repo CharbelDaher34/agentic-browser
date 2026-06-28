@@ -4,16 +4,15 @@ import { useAuth } from './auth.jsx'
 import { ThemeToggle } from './theme.jsx'
 import ChatPanel from './chat/ChatPanel.jsx'
 import LivePanel from './live/LivePanel.jsx'
-import Settings from './Settings.jsx'
-import NewSessionModal from './NewSessionModal.jsx'
 import { useChat } from './chat/useChat.js'
+import { sumUsage } from './chat/chatReducer.js'
+import { SessionUsageBar } from './chat/usage.jsx'
 import ApprovalModal from './chat/ApprovalModal.jsx'
 import MiniChat from './chat/MiniChat.jsx'
 
 // Single-session UI: every user works in ONE browser session (the backend still
-// supports many). We use the user's existing session, or create exactly one at
-// startup — silently for a local dev, or via a keys prompt when the deploy needs
-// per-user Browserbase creds.
+// supports many). We use the user's existing session, or silently create one at
+// startup. Provider keys come from the server's env (no per-session key setup).
 export default function Workspace() {
   const { user, logout } = useAuth()
   const [session, setSession] = useState(null)   // the single browser session
@@ -30,13 +29,8 @@ export default function Workspace() {
     } catch {}
   }
   const [maxLive, setMaxLive] = useState(false)   // live browser fills the workspace
-  const [showSettings, setShowSettings] = useState(false)
-  const [showNewSession, setShowNewSession] = useState(false)
-  const [config, setConfig] = useState(null)      // browser provider + BYOK needs
   const creatingRef = useRef(false)               // guard against double auto-create
   const chatSession = useChat(selected)
-
-  useEffect(() => { api.appConfig().then(setConfig).catch(() => {}) }, [])
 
   const refresh = useCallback(async () => {
     try {
@@ -57,54 +51,20 @@ export default function Workspace() {
     } catch { return null }
   }, [])
 
-  // Ensure exactly one USABLE session exists at start. Creates one when none
-  // exists; on a Browserbase deploy, a session that exists but lost its keys
-  // (purged when it was reaped) is treated as "needs setup" so the keys modal
-  // reappears instead of letting the next chat error out.
+  // Ensure exactly one browser session exists at start; silently create one if
+  // none (provider keys come from the server's env — no setup prompt needed).
   useEffect(() => {
-    if (!config) return
     let cancelled = false
     ;(async () => {
       const sess = await refresh()
-      if (cancelled) return
-      if (!sess) {
-        if (config.browserbase_required) {
-          setShowNewSession(true)   // deploy: user must provide Browserbase creds
-        } else if (!creatingRef.current) {
-          creatingRef.current = true   // local/dev: just open one
-          try { await api.createSession({ name: 'Session' }); await refresh() }
-          catch {} finally { creatingRef.current = false }
-        }
-        return
-      }
-      // session exists — on a Browserbase deploy, make sure it still has creds
-      if (config.browserbase_required) {
-        try {
-          const k = await api.sessionKeys(sess.session_id)
-          if (!cancelled && !k.browserbase) setShowNewSession(true)
-        } catch {}
-      }
+      if (cancelled || sess || creatingRef.current) return
+      creatingRef.current = true
+      try { await api.createSession({ name: 'Session' }); await refresh() }
+      catch {} finally { creatingRef.current = false }
     })()
     return () => { cancelled = true }
-  }, [config, refresh])
+  }, [refresh])
 
-  const createSession = async (payload) => {
-    if (session) {
-      // revive the existing keyless session by adding its keys (don't make a new one)
-      if (payload.browserbase) {
-        await api.saveSessionBrowserbase(
-          session.session_id, payload.browserbase.api_key, payload.browserbase.project_id
-        )
-      }
-      for (const [p, key] of Object.entries(payload.keys || {})) {
-        await api.saveSessionKey(session.session_id, p, key)
-      }
-    } else {
-      await api.createSession(payload)   // throws on bad/missing creds -> shown in the modal
-    }
-    setShowNewSession(false)
-    await refresh()
-  }
   const newChat = async () => {
     if (!session) return
     const title = prompt('Chat title', 'New chat')
@@ -131,18 +91,11 @@ export default function Workspace() {
             <span>Chats</span>
             <button className="btn mini ghost" onClick={newChat} disabled={!session}>+ New</button>
           </div>
-          {!session && (config?.browserbase_required ? (
-            <div style={{ padding: '8px 10px' }}>
-              <div className="faint" style={{ fontSize: 13, marginBottom: 8 }}>
-                Add your Browserbase keys to open a browser session.
-              </div>
-              <button className="btn primary mini" onClick={() => setShowNewSession(true)}>Set up session</button>
-            </div>
-          ) : (
+          {!session && (
             <div className="faint" style={{ padding: '8px 10px', fontSize: 13 }}>
               Setting up your browser session…
             </div>
-          ))}
+          )}
           {(() => {
             if (!session) return null
             const myChats = chats.filter((c) => c.session_id === session.session_id)
@@ -166,21 +119,17 @@ export default function Workspace() {
           })()}
         </div>
 
+        {selected && <SessionUsageBar total={sumUsage(chatSession.state.messages)} />}
+
         <div className="sidebar-foot">
           <div className="avatar">{(user.username || '?').slice(0, 2).toUpperCase()}</div>
           <div className="grow" style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {user.username}
           </div>
           {session && <span className={'dot' + (session.live ? ' live' : '')} title={session.live ? 'browser live' : 'browser idle'} />}
-          <button className="btn mini ghost" title="Session keys" onClick={() => setShowSettings(true)}>⚙</button>
           <button className="btn mini ghost" onClick={logout}>Sign out</button>
         </div>
       </aside>
-
-      {showSettings && <Settings sessionId={session?.session_id} enforceByok={config?.enforce_byok} onClose={() => setShowSettings(false)} />}
-      {showNewSession && (
-        <NewSessionModal config={config} existing={!!session} onCreate={createSession} onClose={() => setShowNewSession(false)} />
-      )}
 
       <main className="main">
         {selected ? (

@@ -1,0 +1,17 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+frontend/node_modules
+frontend/dist
+artifacts
+.env
+.env.*
+!.env.example
+*.db
+tests
+docs
+infra
+Makefile
+PACKAGING*.md
+applicationdesign.md

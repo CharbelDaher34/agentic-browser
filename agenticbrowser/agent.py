@@ -41,16 +41,10 @@ from pydantic_ai import (
 from pydantic_ai.capabilities import ProcessHistory
 from pydantic_ai.exceptions import ApprovalRequired
 
-from .config import settings
+from .config import CoreConfig
 from .history import compact_history, strip_old_screenshots
 from .models import Action, ActionKind, Risk, StreamEvent
-from .models_registry import (
-    ModelAlias,
-    alias_choices,
-    build_model,
-    build_vision_model,
-    pick_model,
-)
+from .models_registry import build_vision_model, resolve_model
 from .recorder import Recorder
 from .registry import SessionRegistry
 
@@ -72,7 +66,7 @@ class AgentDeps:
     tab_id: str = "t0"              # which browser tab this agent drives
     depth: int = 0                  # 0 = orchestrator, >=1 = sub-agent
     label: str = "main"             # event label for the UI ("main" / "sub:t3")
-    user_keys: dict = field(default_factory=dict)  # BYOK: {provider: api_key}
+    cfg: CoreConfig = field(default_factory=CoreConfig)  # injected runtime config (incl. provider_keys)
 
     def next_idx(self) -> int:
         self._idx[0] += 1
@@ -334,7 +328,7 @@ async def locate(ctx: RunContext[AgentDeps], description: str) -> str:
                 f"Find this element: {description}. The image is {w}x{h} pixels.",
                 BinaryContent(data=shot, media_type="image/png"),
             ],
-            model=build_vision_model(ctx.deps.user_keys),
+            model=build_vision_model(ctx.deps.cfg),
             usage=ctx.usage,
         )
     except Exception as exc:  # noqa: BLE001
@@ -408,11 +402,9 @@ ORCHESTRATOR_PROMPT = (
     "the browser.\n\n"
     + _BROWSE_HELP
     + "\n\nDelegation: for independent sub-tasks or side-quests, call `spawn_subagents(tasks=[…])` — "
-    f"each task runs on its OWN browser tab in parallel (up to {settings().max_concurrent_subagents} "
-    "at once) and returns a CONCISE result, keeping your context focused. For each task pick a "
-    f"`model_alias` from {alias_choices()}: 'fast' for simple lookups, 'smart' for general work, "
-    "'deep' for hard reasoning. Optionally pass an existing `tab` id to reuse a tab; otherwise a new "
-    "one is opened. Manage tabs with `open_tab`/`list_tabs`/`close_tab`.\n\n"
+    "each task runs on its OWN browser tab in parallel and returns a CONCISE result, keeping your "
+    "context focused (concrete limits are stated below). Optionally pass an existing `tab` id to "
+    "reuse a tab; otherwise a new one is opened. Manage tabs with `open_tab`/`list_tabs`/`close_tab`.\n\n"
     "Call `finish(result)` when the goal is complete. Destructive actions (pay, delete, send, "
     "irreversible submits) require user approval."
 )
@@ -428,12 +420,20 @@ agent = Agent(
 )
 
 
+@agent.system_prompt
+def _delegation_limits(ctx: RunContext[AgentDeps]) -> str:
+    # the concrete sub-agent/tab limits, injected from CoreConfig per run (replaces
+    # the old import-time settings() interpolation so the core needs no global).
+    c = ctx.deps.cfg
+    return (
+        f"Delegation limits: spawn at most {c.max_concurrent_subagents} sub-agent(s) "
+        f"in parallel, across at most {c.max_tabs} browser tabs total."
+    )
+
+
 # ---- orchestrator-only tools (delegation + tab management) -----------------
 class SubTask(BaseModel):
     task: str = Field(description="the self-contained instruction for the sub-agent")
-    model_alias: ModelAlias = Field(
-        default=ModelAlias.smart, description="which model the sub-agent should run on"
-    )
     tab: str | None = Field(
         default=None, description="existing tab id to reuse, or null to open a new tab"
     )
@@ -453,14 +453,16 @@ async def _run_subtask(ctx: RunContext[AgentDeps], t: SubTask) -> dict:
         sub_deps = AgentDeps(
             session_id=d.session_id, chat_id=d.chat_id, lease_token=lease.token,
             registry=d.registry, recorder=d.recorder, emit=d.emit, _idx=d._idx,
-            tab_id=tab_id, depth=d.depth + 1, label=f"sub:{tab_id}", user_keys=d.user_keys,
+            tab_id=tab_id, depth=d.depth + 1, label=f"sub:{tab_id}",
+            cfg=d.cfg,
         )
+        worker_spec = d.cfg.worker_model or d.cfg.agent_model
         await d.emit(StreamEvent("subagent_start", d.chat_id, {
-            "id": tab_id, "task": t.task, "model": t.model_alias.value, "tab": tab_id,
+            "id": tab_id, "task": t.task, "model": worker_spec, "tab": tab_id,
         }))
         r = await subagent.run(
             t.task, deps=sub_deps,
-            model=build_model(pick_model(t.model_alias, ctx.deps.user_keys), ctx.deps.user_keys),
+            model=resolve_model(worker_spec, ctx.deps.cfg),
             usage=ctx.usage,
         )
         await d.emit(StreamEvent("subagent_end", d.chat_id, {
@@ -482,7 +484,7 @@ async def spawn_subagents(ctx: RunContext[AgentDeps], tasks: list[SubTask]) -> s
 
     Returns a concise digest of every sub-agent's result."""
     d = ctx.deps
-    cfg = settings()
+    cfg = ctx.deps.cfg
     if d.depth >= cfg.max_subagent_depth:
         return "Sub-agents cannot spawn their own sub-agents — do the work directly."
     if not tasks:
@@ -522,13 +524,10 @@ async def spawn_subagents(ctx: RunContext[AgentDeps], tasks: list[SubTask]) -> s
 async def spawn_subagent(
     ctx: RunContext[AgentDeps],
     task: str,
-    model_alias: ModelAlias = ModelAlias.smart,
     tab: str | None = None,
 ) -> str:
     """Delegate a single side-task to one sub-agent on its own tab; returns its result."""
-    return await spawn_subagents(
-        ctx, [SubTask(task=task, model_alias=model_alias, tab=tab)]
-    )
+    return await spawn_subagents(ctx, [SubTask(task=task, tab=tab)])
 
 
 @agent.tool
@@ -536,8 +535,8 @@ async def open_tab(ctx: RunContext[AgentDeps], url: str | None = None, label: st
     """Open a new browser tab (optionally navigating to `url`). Returns its tab id."""
     d = ctx.deps
     session = d.registry.get(d.session_id)
-    if len(session.list_tabs()) >= settings().max_tabs:
-        return f"Tab budget reached (max {settings().max_tabs}); close a tab first."
+    if len(session.list_tabs()) >= ctx.deps.cfg.max_tabs:
+        return f"Tab budget reached (max {ctx.deps.cfg.max_tabs}); close a tab first."
     tab_id = await session.open_tab(url=url, label=label)
     return f"Opened tab {tab_id}" + (f" at {url}" if url else "") + "."
 

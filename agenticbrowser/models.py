@@ -5,7 +5,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal, Mapping, Sequence
+from typing import Literal, Sequence
+
+# StreamEvent now lives in events.py (the frozen, versioned wire contract).
+# Re-exported here for backwards-compatible `from .models import StreamEvent`.
+from .events import StreamEvent  # noqa: F401
 
 
 class Risk(str, Enum):
@@ -133,12 +137,4 @@ class StepRecord:
     screenshot_uri: str | None
 
 
-@dataclass(frozen=True, slots=True)
-class StreamEvent:
-    type: Literal[
-        "token", "thinking", "tool_call", "action",
-        "observation", "approval_request", "final", "error", "lease",
-        "live_view", "subagent_start", "subagent_end", "interrupted",
-    ]
-    chat_id: str
-    data: Mapping[str, Any] = field(default_factory=dict)
+# (StreamEvent is defined in events.py and re-exported at the top of this module.)

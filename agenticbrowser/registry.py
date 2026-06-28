@@ -18,11 +18,11 @@ import secrets
 import time
 from dataclasses import dataclass, field
 
-from .config import settings
+from .config import CoreConfig
 from .models import DriverKind, Lease, ProviderName
 from .providers import make_provider
 from .session import PlaywrightSession
-from .store import Store
+from .stores import Store
 
 _PRIMARY = "t0"
 
@@ -46,8 +46,9 @@ class _Entry:
 
 
 class SessionRegistry:
-    def __init__(self, store: Store) -> None:
+    def __init__(self, store: Store, cfg: CoreConfig) -> None:
         self._store = store
+        self._cfg = cfg
         self._sessions: dict[str, _Entry] = {}
         self._create_lock = asyncio.Lock()
 
@@ -57,20 +58,15 @@ class SessionRegistry:
         async with self._create_lock:
             if session_id in self._sessions:
                 return session_id
-            # per-session BYOK: browserbase creds come from the session's own keys
-            # (or the server env fallback for a local dev). make_provider raises at
-            # open() if neither is present.
-            prov = provider_name or settings().browser_provider
-            bb_creds = (
-                await self._store.load_session_browserbase_creds(session_id)
-                if prov == "browserbase" else None
-            )
-            provider = make_provider(prov, browserbase_creds=bb_creds)
+            # browserbase creds come from CoreConfig (SDK `browserbase=`, or the
+            # server's .env). make_provider raises at open() if they're missing.
+            prov = provider_name or self._cfg.browser_provider
+            provider = make_provider(prov, cfg=self._cfg)
             prior = await self._store.load_storage_state(session_id)
             # reconnect to a still-live browserbase session if we have its id
             prior_bb = await self._store.load_bb_session_id(session_id)
             session = await PlaywrightSession.open(
-                provider, storage_state=prior, reconnect_id=prior_bb
+                provider, storage_state=prior, cfg=self._cfg, reconnect_id=prior_bb
             )
             # Only a FRESH session needs the last page restored; a reconnected live
             # session is already on its current page (don't navigate it away).
@@ -187,7 +183,7 @@ class SessionRegistry:
 
     async def reap_idle(self) -> None:
         now = time.monotonic()
-        ttl = settings().idle_ttl_seconds
+        ttl = self._cfg.idle_ttl_seconds
         for sid, e in list(self._sessions.items()):
             # never reap a session attached to a chat OR with ANY tab being driven
             # (a turn in flight / human takeover holds a tab lease).
@@ -195,8 +191,8 @@ class SessionRegistry:
             if not e.chats and not any_driven and now - e.last_used > ttl:
                 # Reaping = genuine session end (unlike shutdown, which is just an
                 # instance recycle). Fully tear down: release the remote browser
-                # (browserbase REQUEST_RELEASE) and PURGE the session's BYOK keys,
-                # so we don't retain users' keys (or pay for idle cloud browsers).
+                # (browserbase REQUEST_RELEASE) and clear its session id so we don't
+                # try to reconnect to a released cloud browser (or pay for idle ones).
                 try:
                     await self._store.save_storage_state(
                         sid, await e.session.storage_state(), last_url=e.session.url
@@ -205,7 +201,6 @@ class SessionRegistry:
                 except Exception:  # noqa: BLE001
                     pass
                 try:
-                    await self._store.delete_session_keys(sid)
                     await self._store.save_bb_session_id(sid, None)
                 except Exception:  # noqa: BLE001
                     pass

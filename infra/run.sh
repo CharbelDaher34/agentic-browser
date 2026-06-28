@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 #
-# run.sh — bring up the whole Agentic Browser stack:
+# infra/run.sh — bring up the whole Agentic Browser stack:
 #   Postgres (docker compose) -> Python deps (uv) -> build frontend -> backend
 #   (uvicorn serves the UI + API on ONE port).
 #
-# Usage:
-#   ./run.sh                 # build UI + serve everything on :BACKEND_PORT (one origin)
-#   DEV=1 ./run.sh           # hot-reload dev: Vite UI on :FRONTEND_PORT, proxy to backend
-#   SKIP_INSTALL=1 ./run.sh  # skip dependency install/sync (faster restarts)
-#   BACKEND_ONLY=1 ./run.sh  # backend + Postgres only (no frontend build/serve)
+# Lives in infra/ but operates from the repo ROOT (so frontend/, .env, and the
+# package resolve). Prefer the Makefile at the repo root: `make dev`, `make run`.
+#
+# Usage (from anywhere):
+#   infra/run.sh                 # build UI + serve everything on :BACKEND_PORT (one origin)
+#   DEV=1 infra/run.sh           # hot-reload dev: Vite UI on :FRONTEND_PORT, proxy to backend
+#   SKIP_INSTALL=1 infra/run.sh  # skip dependency install/sync (faster restarts)
+#   BACKEND_ONLY=1 infra/run.sh  # backend + Postgres only (no frontend build/serve)
+#
+# By default the stack runs inside a detached GNU screen named "agenticemirates"
+# (so it survives your SSH session). Attach with `screen -r agenticemirates`.
+#   NO_SCREEN=1 infra/run.sh     # run inline in the current terminal (no screen)
 #
 set -euo pipefail
-cd "$(dirname "$0")"
+# this script lives in infra/; run everything from the repo root
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+cd "$ROOT"
 
 # ---- config (override via env) ---------------------------------------------
 BACKEND_HOST="${BACKEND_HOST:-0.0.0.0}"
@@ -24,10 +35,56 @@ BACKEND_ONLY="${BACKEND_ONLY:-0}"
 # Vite/proxy). DEV=1 instead runs the Vite dev server (hot reload) on its own
 # port, proxying /api and /ws to the backend.
 DEV="${DEV:-0}"
+# Run the stack inside a detached `screen` session of this name. Set NO_SCREEN=1
+# to run inline instead (e.g. CI, or when you want Ctrl+C in your own terminal).
+SCREEN_NAME="${SCREEN_NAME:-agenticemirates}"
+NO_SCREEN="${NO_SCREEN:-0}"
 
 log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---- 0. (re)launch inside a detached screen --------------------------------
+# Unless NO_SCREEN=1 (also set on the re-exec, so this runs at most once), start
+# the whole stack inside a detached `screen` named "$SCREEN_NAME" and return the
+# prompt. The child re-runs THIS script with NO_SCREEN=1 so the logic below runs
+# normally inside the session. The current env (DEV/BACKEND_ONLY/…) + args carry
+# through because screen inherits them.
+if [ "$NO_SCREEN" != "1" ]; then
+  if command -v screen >/dev/null 2>&1; then
+    # replace any stale session(s) of the SAME name (idempotent re-runs). screen
+    # -list prints one "<pid>.<name>\t(date)\t(state)" line per session; grab each
+    # exact "<pid>.<name>" tag (anchored on the trailing tab so "agenticemirates2"
+    # is not a false hit) and quit it by tag — `-X quit` on the bare name fails if
+    # duplicates exist ("several suitable screens").
+    tab=$'\t'
+    stale="$(screen -list 2>/dev/null | grep -F ".${SCREEN_NAME}${tab}" \
+             | grep -oE "[0-9]+\.${SCREEN_NAME}\b" || true)"
+    if [ -n "$stale" ]; then
+      warn "A screen named '$SCREEN_NAME' already exists — replacing it."
+      while IFS= read -r tag; do
+        [ -n "$tag" ] && screen -S "$tag" -X quit >/dev/null 2>&1 || true
+      done <<< "$stale"
+      sleep 1
+    fi
+    log "Launching the stack in a detached screen: '$SCREEN_NAME'"
+    # -dm: detached; the inner bash keeps the window open if the script exits so
+    # you can read the logs/errors. NO_SCREEN=1 prevents infinite re-exec.
+    NO_SCREEN=1 screen -S "$SCREEN_NAME" -dm bash -c "'$SCRIPT_DIR/run.sh' \"\$@\"; ec=\$?; echo; echo \"[run.sh exited with code \$ec — press Enter to close]\"; read -r" bash "$@"
+    cat <<EOF
+
+  ✅ Started in screen session '$SCREEN_NAME'.
+     Attach:        screen -r $SCREEN_NAME
+     Detach again:  Ctrl-A then D
+     Stop the app:  screen -S $SCREEN_NAME -X quit   (or Ctrl-C while attached)
+     App will be on http://${BACKEND_HOST}:${BACKEND_PORT}
+
+EOF
+    exit 0
+  else
+    warn "screen not found — running inline (install 'screen' to background it). Set NO_SCREEN=1 to silence this."
+  fi
+fi
 
 # kill whatever is holding a TCP port (tolerant of nothing being there)
 free_port() {
@@ -42,8 +99,8 @@ free_port() {
 
 # ---- prerequisites ----------------------------------------------------------
 command -v uv  >/dev/null 2>&1 || die "uv not found — install from https://docs.astral.sh/uv/"
-if docker compose version >/dev/null 2>&1; then DC="docker compose"
-elif command -v docker-compose >/dev/null 2>&1; then DC="docker-compose"
+if docker compose version >/dev/null 2>&1; then DC="docker compose -f $COMPOSE_FILE"
+elif command -v docker-compose >/dev/null 2>&1; then DC="docker-compose -f $COMPOSE_FILE"
 else die "docker compose not found"; fi
 
 if [ "$BACKEND_ONLY" != "1" ]; then
@@ -55,8 +112,10 @@ if [ ! -f .env ] || ! grep -q '^ANTHROPIC_API_KEY=..' .env 2>/dev/null; then
 fi
 
 # ---- 1. Postgres ------------------------------------------------------------
+# Only the DB — the compose file also defines the full `app` service (self-host),
+# which we DON'T want for local dev (run.sh runs uvicorn itself below).
 log "Starting Postgres (docker compose) on :$PG_PORT…"
-$DC up -d
+$DC up -d postgres
 
 log "Waiting for Postgres to accept connections…"
 for i in $(seq 1 60); do
@@ -115,7 +174,7 @@ fi
 
 RELOAD=""; [ "$DEV" = "1" ] && RELOAD="--reload"
 log "Starting backend → http://$BACKEND_HOST:$BACKEND_PORT"
-PYTHONPATH="$PWD" uv run uvicorn app.gateway:app \
+PYTHONPATH="$PWD" uv run uvicorn agenticbrowser.server.gateway:app \
   --host "$BACKEND_HOST" --port "$BACKEND_PORT" $RELOAD &
 PIDS+=($!)
 
@@ -143,7 +202,11 @@ elif [ "$BACKEND_ONLY" != "1" ]; then
 else
   printf '\n\033[1;32m==> Up!  API: http://%s:%s\033[0m\n' "$BACKEND_HOST" "$BACKEND_PORT"
 fi
-echo "    Press Ctrl+C to stop."
+if [ -n "${STY:-}" ]; then
+  echo "    In screen '$SCREEN_NAME' — Ctrl-A then D to detach, or Ctrl-C to stop the app."
+else
+  echo "    Press Ctrl+C to stop."
+fi
 
 # wait on the background jobs; if either exits, fall through to cleanup
 wait

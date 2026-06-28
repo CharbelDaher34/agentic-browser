@@ -19,7 +19,7 @@ from typing import Awaitable, Callable
 
 from playwright.async_api import BrowserContext, CDPSession, Page, async_playwright
 
-from .config import settings
+from .config import CoreConfig
 from .models import LiveViewMode, ProviderName
 
 # Anti-automation hardening (adapted from computers/playwright): make the
@@ -72,6 +72,9 @@ class BrowserProvider(ABC):
 class LocalProvider(BrowserProvider):
     name = "local"
 
+    def __init__(self, cfg: CoreConfig) -> None:
+        self._cfg = cfg
+
     async def open(
         self, storage_state: dict | None = None, *, reconnect_id: str | None = None
     ) -> OpenBrowser:
@@ -79,7 +82,7 @@ class LocalProvider(BrowserProvider):
         # is accepted for interface parity and ignored.
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
-            headless=settings().headless, args=_STEALTH_LAUNCH_ARGS
+            headless=self._cfg.headless, args=_STEALTH_LAUNCH_ARGS
         )
         # restoring the FULL storage_state (cookies + localStorage/origins) at
         # context creation is the only way Playwright rehydrates localStorage.
@@ -106,14 +109,12 @@ class LocalProvider(BrowserProvider):
 class BrowserbaseProvider(BrowserProvider):
     name = "browserbase"
 
-    def __init__(self, project_id: str | None = None, api_key: str | None = None) -> None:
-        # per-user BYOK creds win; otherwise the server's — unless enforce_byok is
-        # set, which disables the server fallback so each user must bring their own.
-        s = settings()
-        fallback_project = None if s.enforce_byok else s.browserbase_project_id
-        fallback_key = None if s.enforce_byok else s.browserbase_api_key
-        self._project_id = project_id or fallback_project
-        self._api_key = api_key or fallback_key
+    def __init__(self, cfg: CoreConfig) -> None:
+        # creds come from CoreConfig — the SDK's `browserbase=` arg, or the server's
+        # .env. Nothing is read per-session.
+        self._cfg = cfg
+        self._project_id = cfg.browserbase_project_id
+        self._api_key = cfg.browserbase_api_key
 
     async def open(
         self, storage_state: dict | None = None, *, reconnect_id: str | None = None
@@ -189,13 +190,9 @@ class BrowserbaseProvider(BrowserProvider):
         )
 
 
-def make_provider(
-    name: ProviderName | None = None, *, browserbase_creds: dict | None = None
-) -> BrowserProvider:
-    name = name or settings().browser_provider  # type: ignore[assignment]
+def make_provider(name: ProviderName | None = None, *, cfg: CoreConfig) -> BrowserProvider:
+    name = name or cfg.browser_provider  # type: ignore[assignment]
     if name == "browserbase":
-        c = browserbase_creds or {}
-        return BrowserbaseProvider(
-            project_id=c.get("project_id"), api_key=c.get("api_key")
-        )
-    return LocalProvider()
+        # creds come from CoreConfig (SDK `browserbase=`, or the server's .env)
+        return BrowserbaseProvider(cfg)
+    return LocalProvider(cfg)

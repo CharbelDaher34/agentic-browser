@@ -3,6 +3,7 @@ import TurnTrail, { MarkdownText } from './TurnTrail.jsx'
 import StepShot from './StepShot.jsx'
 import Composer from './Composer.jsx'
 import AuditView from '../AuditView.jsx'
+import { UsageLine } from './usage.jsx'
 
 // Presentational: the chat WS + state live in the `session` (useChat) owned by
 // Workspace, so the socket survives while this panel is hidden in full-screen.
@@ -73,6 +74,7 @@ function MessageBubble({ m }) {
         {hasItems
           ? <TurnTrail items={m.items} subagents={m.subagents} />
           : <MarkdownText text={m.text} />}
+        {m.usage && <UsageLine u={m.usage} />}
       </div>
     </div>
   )

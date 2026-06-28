@@ -10,18 +10,14 @@ artifacts/
 
 # frontend
 frontend/node_modules/
-# frontend/dist is intentionally NOT ignored: FastAPI serves it single-origin and
-# `fastapi deploy` respects .gitignore, so the built UI must ship in the bundle.
-# Rebuild before deploying: cd frontend && npm run build
+# frontend/dist is intentionally NOT ignored: the gateway serves it single-origin
+# (SERVE_UI). Rebuild before deploying: cd frontend && npm run build
 
 # uv
 .python-version
 computers/
 .agents/
-# BYOK encryption key
-.app_secret
 .env.*
 # ...but DO track the documented template
 !.env.example
-# FastAPI Cloud CLI auth token + app link (FASTAPI_CLOUD_CLI_CONFIG_DIR points here)
-.fastapicloud/
+node_modules/

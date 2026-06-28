@@ -1,0 +1,68 @@
+# Self-host stack (Group 2): the Agentic Browser gateway + bundled Postgres.
+#
+#   docker compose -f infra/docker-compose.yml up --build      # app on :8000 (REST + WS + UI)
+#   docker compose -f infra/docker-compose.yml up -d postgres  # just the DB (local dev)
+#
+# Or via the Makefile at the repo root:  make up / make db / make down
+#
+# The build context is the repo root (..) so the Dockerfile can COPY pyproject.toml,
+# agenticbrowser/, frontend/, main.py. The .dockerignore lives at the repo root.
+#
+# For production, point DATABASE_URL at a managed Postgres and drop the `postgres`
+# service. Set the provider key matching AGENT_MODEL (the server uses its own keys).
+
+# Pin the project name so it's stable no matter where this file lives or what dir
+# you invoke it from (otherwise Compose derives it from the folder — moving this
+# into infra/ would orphan existing containers + the pgdata volume).
+name: agenticbrowser
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    image: agenticbrowser:latest
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    shm_size: "1gb"                     # Chromium needs a real /dev/shm
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      SERVE_UI: "${SERVE_UI:-true}"     # false -> pure API (no bundled UI)
+      BROWSER_PROVIDER: "${BROWSER_PROVIDER:-local}"
+      AGENT_MODEL: "${AGENT_MODEL:-anthropic:claude-sonnet-4-6}"
+      # provider keys (the server uses its own keys for every session) — set the
+      # one matching AGENT_MODEL, plus Browserbase creds if BROWSER_PROVIDER=browserbase.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      BROWSERBASE_API_KEY: "${BROWSERBASE_API_KEY:-}"
+      BROWSERBASE_PROJECT_ID: "${BROWSERBASE_PROJECT_ID:-}"
+      ALLOW_REGISTRATION: "${ALLOW_REGISTRATION:-false}"
+      BOOTSTRAP_USERNAME: "${BOOTSTRAP_USERNAME:-}"
+      BOOTSTRAP_PASSWORD: "${BOOTSTRAP_PASSWORD:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    # no fixed container_name — let Compose namespace it as
+    # "agenticbrowser-postgres-1" so it can't clash with other projects' postgres.
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "${PG_PORT:-7935}:5432"         # host port overridable (matches run.sh PG_PORT)
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

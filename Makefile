@@ -1,91 +1,81 @@
-# Makefile — FastAPI Cloud commands wired to the PROJECT-LOCAL credentials.
+# Agentic Browser — operations Makefile.
 #
-# The auth token + app link live in ./.fastapicloud/ (gitignored), not in
-# ~/.config. Every target below points the CLI there via
-# FASTAPI_CLOUD_CLI_CONFIG_DIR, same as deploy.sh — so these work without a
-# global `fastapi login`.
-#
-# Uses the project venv's pinned CLI (.venv/bin/fastapi), not whatever `fastapi`
-# happens to be on PATH.
-#
-# Usage:
-#   make deploy                       # deploy (blocks on build)
-#   make deploy-no-wait               # deploy, don't wait for the build
-#   make logs                         # stream live logs
-#   make logs-recent                  # last 100 lines, then exit
-#   make env-list                     # show registered env vars
-#   make env-set NAME=FOO VALUE=bar   # set an env var
-#   make env-set-secret NAME=FOO VALUE=bar   # set a secret env var
-#   make env-get NAME=FOO             # read one env var
-#   make env-delete NAME=FOO          # delete an env var
-#   make whoami                       # who the local token is logged in as
-#   make deployments                  # list deployments
-#   make help                         # list all targets
+# Thin wrapper over infra/ (Docker self-host + the local dev script). All Docker
+# files live in infra/; the build context is the repo root (this directory), and
+# .dockerignore stays here. Run `make help` for the full list.
 
-# Resolve to this Makefile's directory so targets work from anywhere.
-ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
-
-# Project-local FastAPI Cloud CLI: pinned venv binary + project-local auth dir.
-export FASTAPI_CLOUD_CLI_CONFIG_DIR := $(ROOT)/.fastapicloud
-FASTAPI := $(ROOT)/.venv/bin/fastapi
-CLOUD   := $(FASTAPI) cloud
+COMPOSE     := docker compose -f infra/docker-compose.yml
+RUN_SH      := infra/run.sh
+SCREEN_NAME := agenticemirates
 
 .DEFAULT_GOAL := help
 
-.PHONY: help deploy deploy-no-wait logs logs-recent env-list env-get \
-        env-set env-set-secret env-delete whoami apps deployments login
+# ---- local development (uvicorn + Postgres via infra/run.sh) -----------------
+# run/dev/backend launch the stack in a detached screen "$(SCREEN_NAME)" and
+# return the prompt; use `make attach` to view it, `make stop` to kill it. Add
+# NO_SCREEN=1 (e.g. `make run NO_SCREEN=1`) to run inline in the current terminal.
 
-help: ## List available targets
+.PHONY: run
+run: ## Local dev in screen: Postgres + backend + built UI on one port
+	$(RUN_SH)
+
+.PHONY: dev
+dev: ## Local dev in screen with hot-reload Vite UI (DEV=1)
+	DEV=1 $(RUN_SH)
+
+.PHONY: backend
+backend: ## Local dev in screen, backend + Postgres only (no frontend build)
+	BACKEND_ONLY=1 $(RUN_SH)
+
+.PHONY: attach
+attach: ## Attach to the running dev screen (Ctrl-A D to detach)
+	screen -r $(SCREEN_NAME)
+
+.PHONY: stop
+stop: ## Stop the dev screen (the backgrounded app)
+	-screen -S $(SCREEN_NAME) -X quit
+
+# ---- Docker self-host (the full image) ---------------------------------------
+
+.PHONY: up
+up: ## Build + start the full self-host stack (app + Postgres) in Docker
+	$(COMPOSE) up --build
+
+.PHONY: up-d
+up-d: ## Same as `up` but detached
+	$(COMPOSE) up --build -d
+
+.PHONY: build
+build: ## Build the Docker image only
+	$(COMPOSE) build
+
+.PHONY: down
+down: ## Stop and remove the self-host stack containers
+	$(COMPOSE) down
+
+.PHONY: db
+db: ## Start only the Postgres service (what local dev uses)
+	$(COMPOSE) up -d postgres
+
+.PHONY: logs
+logs: ## Tail logs from the running stack
+	$(COMPOSE) logs -f
+
+.PHONY: ps
+ps: ## Show the status of the stack services
+	$(COMPOSE) ps
+
+.PHONY: config
+config: ## Validate + render the resolved compose config
+	$(COMPOSE) config
+
+.PHONY: clean
+clean: ## Stop the stack and delete its volumes (DROPS the Postgres data)
+	$(COMPOSE) down -v
+
+# ---- meta --------------------------------------------------------------------
+
+.PHONY: help
+help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
-		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
-
-## ---- deploy ---------------------------------------------------------------
-
-deploy: ## Deploy to FastAPI Cloud (blocks on the build)
-	$(CLOUD) deploy "$(ROOT)"
-
-deploy-no-wait: ## Deploy without waiting for the build to finish
-	$(CLOUD) deploy --no-wait "$(ROOT)"
-
-## ---- logs -----------------------------------------------------------------
-
-logs: ## Stream live logs (Ctrl-C to stop)
-	$(CLOUD) logs "$(ROOT)"
-
-logs-recent: ## Fetch the last 100 log lines and exit (override: TAIL=, SINCE=)
-	$(CLOUD) logs --no-follow --tail $(or $(TAIL),100) --since $(or $(SINCE),5m) "$(ROOT)"
-
-## ---- environment variables ------------------------------------------------
-
-env-list: ## List the app's registered env vars
-	$(CLOUD) env list
-
-env-get: ## Read one env var: make env-get NAME=DATABASE_URL
-	@test -n "$(NAME)" || { echo "usage: make env-get NAME=KEY"; exit 1; }
-	$(CLOUD) env get "$(NAME)"
-
-env-set: ## Set an env var: make env-set NAME=KEY VALUE=val
-	@test -n "$(NAME)" || { echo "usage: make env-set NAME=KEY VALUE=val"; exit 1; }
-	$(CLOUD) env set "$(NAME)" "$(VALUE)"
-
-env-set-secret: ## Set a SECRET env var: make env-set-secret NAME=KEY VALUE=val
-	@test -n "$(NAME)" || { echo "usage: make env-set-secret NAME=KEY VALUE=val"; exit 1; }
-	$(CLOUD) env set --secret "$(NAME)" "$(VALUE)"
-
-env-delete: ## Delete an env var: make env-delete NAME=KEY
-	@test -n "$(NAME)" || { echo "usage: make env-delete NAME=KEY"; exit 1; }
-	$(CLOUD) env delete "$(NAME)"
-
-## ---- account / app inspection ---------------------------------------------
-
-whoami: ## Show the currently logged-in user (for the local token)
-	$(CLOUD) whoami
-
-apps: ## Manage / list your FastAPI Cloud apps
-	$(CLOUD) apps
-
-deployments: ## List deployments for this app
-	$(CLOUD) deployments list
-
-login: ## (Re)authenticate the project-local token
-	$(CLOUD) login
+		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
