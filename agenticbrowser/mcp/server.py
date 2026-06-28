@@ -9,8 +9,8 @@ host log in once and reuse the authenticated browser across calls.
 
 The destructive-action approval gate becomes MCP **elicitation**: when the agent
 hits a pay/buy/delete/checkout step, the host is asked to approve. If the host
-can't elicit, the action is auto-denied (fail-safe) unless
-`BROWSER_AGENT_AUTO_APPROVE=true`.
+can't elicit, the action is auto-denied (fail-safe). Destructive actions are never
+auto-approved.
 
 Run it:
     uvx agenticbrowser-mcp            # stdio (Claude Desktop default)
@@ -19,7 +19,7 @@ Run it:
 Config via env: ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY,
 BROWSER_AGENT_BACKEND=local|browserbase (+ BROWSERBASE_API_KEY / _PROJECT_ID),
 AGENT_MODEL, BROWSER_AGENT_HEADLESS, BROWSER_AGENT_SUBAGENTS,
-BROWSER_AGENT_MAX_STEPS, BROWSER_AGENT_AUTO_APPROVE.
+BROWSER_AGENT_MAX_STEPS.
 """
 
 from __future__ import annotations
@@ -79,9 +79,10 @@ def _base_kwargs() -> dict:
 
 
 def _make_approver(ctx: Context):
-    """An approve= handler that asks the MCP host via elicitation, falling back to
-    the env default (deny, unless BROWSER_AGENT_AUTO_APPROVE) when the host can't."""
-    auto_approve = _env_bool("BROWSER_AGENT_AUTO_APPROVE", False)
+    """An approve= handler that asks the MCP host via elicitation. Every request that
+    reaches it is a DESTRUCTIVE action (the gate only ever pauses on those), so if the
+    host can't elicit a human decision we fail CLOSED and deny. Destructive actions are
+    never auto-approved — there is no env flag that turns the gate into a no-op."""
 
     async def approve(req: ApprovalRequest) -> Approval:
         try:
@@ -91,12 +92,10 @@ def _make_approver(ctx: Context):
                 schema=_ApprovalDecision,
             )
         except Exception:  # noqa: BLE001 — host doesn't support elicitation
-            return (
-                Approval.allow()
-                if auto_approve
-                else Approval.deny(
-                    "auto-denied (host cannot elicit; set BROWSER_AGENT_AUTO_APPROVE=true to allow)"
-                )
+            # fail closed: a destructive action with no human to approve is denied.
+            return Approval.deny(
+                "auto-denied: this host cannot prompt for approval, and destructive "
+                "actions are never auto-approved."
             )
         if result.action == "accept" and getattr(result, "data", None) and result.data.approve:
             return Approval.allow()

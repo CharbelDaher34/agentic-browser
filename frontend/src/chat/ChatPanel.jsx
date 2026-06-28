@@ -74,7 +74,7 @@ function MessageBubble({ m }) {
         {hasItems
           ? <TurnTrail items={m.items} subagents={m.subagents} />
           : <MarkdownText text={m.text} />}
-        {m.usage && <UsageLine u={m.usage} />}
+        <UsageLine u={m.usage} />
       </div>
     </div>
   )

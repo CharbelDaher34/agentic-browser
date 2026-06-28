@@ -48,6 +48,31 @@ export function shortArgs(args, max = 90) {
 
 const clip = (t, n) => (t && t.length > n ? t.slice(0, n) + '…' : t || '')
 
+// A short, human-readable description of a recorded action (audit + live trail), e.g.
+// Clicked “Place Order” / Typed “hello” into “Search”. `a` is an Action.to_json() dict.
+export function describeAction(a) {
+  if (!a) return ''
+  const xy = (x, y) => `(${Math.round(x)}, ${Math.round(y)})`
+  const tgt = a.target ? `“${a.target}”` : (a.ref ? `[${a.ref}]` : '')
+  switch (a.kind) {
+    case 'navigate':  return `Navigated to ${a.url || ''}`.trim()
+    case 'click':
+    case 'click_at':  return tgt ? `Clicked ${tgt}` : `Clicked at ${xy(a.x, a.y)}`
+    case 'type':
+    case 'type_at':   return `Typed “${a.text ?? ''}”${tgt ? ` into ${tgt}` : ''}${a.submit ? ' then Enter' : ''}`
+    case 'select':    return `Selected “${a.text ?? ''}”${tgt ? ` in ${tgt}` : ''}`
+    case 'scroll':
+    case 'scroll_at': return `Scrolled ${a.direction || 'down'}`
+    case 'key':       return `Pressed ${a.keys || ''}`
+    case 'drag':      return `Dragged ${xy(a.x, a.y)} → ${xy(a.x2, a.y2)}`
+    case 'back':      return 'Went back'
+    case 'forward':   return 'Went forward'
+    case 'wait':      return `Waited ${a.seconds ?? ''}s`
+    case 'extract':   return 'Read the page'
+    default:          return a.kind || ''
+  }
+}
+
 // One trail item rendered WITHOUT its own collapsible (used inside a work group).
 function RawItem({ it }) {
   switch (it.kind) {
@@ -65,7 +90,7 @@ function RawItem({ it }) {
         </div>
       )
     case 'action':
-      return <div className="trail-row action"><span className="icn">▸</span><span className="body">{it.action}{it.ref ? ` [${it.ref}]` : ''}</span></div>
+      return <div className="trail-row action"><span className="icn">▸</span><span className="body">{it.action}{it.target ? ` “${it.target}”` : it.ref ? ` [${it.ref}]` : ''}</span></div>
     case 'observation':
       return (
         <div className="trail-row obs">

@@ -10,13 +10,13 @@ import typing
 
 from agenticbrowser.events import EVENT_DATA_KEYS, EVENT_SCHEMA_VERSION, EventType
 
-EXPECTED_VERSION = "1.0"
+EXPECTED_VERSION = "1.1"
 
 EXPECTED_DATA_KEYS = {
     "token": {"text"},
     "thinking": {"text"},
     "tool_call": {"tool", "args"},
-    "action": {"action", "ref", "agent", "tab"},
+    "action": {"action", "ref", "target", "agent", "tab"},
     "observation": {"idx", "url", "title", "ok", "changed", "agent", "tab"},
     "approval_request": {"calls"},
     "final": {"text"},

@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
-EVENT_SCHEMA_VERSION = "1.0"
+EVENT_SCHEMA_VERSION = "1.1"
 
 EventType = Literal[
     "token",            # incremental assistant text
@@ -49,7 +49,7 @@ EVENT_DATA_KEYS: dict[str, set[str]] = {
     "token": {"text"},
     "thinking": {"text"},
     "tool_call": {"tool", "args"},
-    "action": {"action", "ref", "agent", "tab"},
+    "action": {"action", "ref", "target", "agent", "tab"},
     "observation": {"idx", "url", "title", "ok", "changed", "agent", "tab"},
     "approval_request": {"calls"},
     "final": {"text"},

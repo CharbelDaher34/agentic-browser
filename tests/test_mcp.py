@@ -60,17 +60,13 @@ async def test_elicit_decline_denies():
     assert (await approve(_REQ)).approved is False
 
 
-async def test_no_elicit_support_auto_denies_by_default(monkeypatch):
-    monkeypatch.delenv("BROWSER_AGENT_AUTO_APPROVE", raising=False)
+async def test_no_elicit_support_fails_closed(monkeypatch):
+    # when the host can't elicit, a destructive action is denied — and NO env flag
+    # can turn that into an approval (the old BROWSER_AGENT_AUTO_APPROVE fail-open).
+    monkeypatch.setenv("BROWSER_AGENT_AUTO_APPROVE", "true")
     approve = mcp_server._make_approver(_Ctx(raise_=True))
     verdict = await approve(_REQ)
     assert verdict.approved is False and "auto-denied" in (verdict.reason or "")
-
-
-async def test_no_elicit_support_auto_approves_when_opted_in(monkeypatch):
-    monkeypatch.setenv("BROWSER_AGENT_AUTO_APPROVE", "true")
-    approve = mcp_server._make_approver(_Ctx(raise_=True))
-    assert (await approve(_REQ)).approved is True
 
 
 def test_base_kwargs_from_env(monkeypatch):

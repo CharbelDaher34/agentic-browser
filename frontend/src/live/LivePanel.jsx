@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { wsUrl } from '../api.js'
 
-export default function LivePanel({ sessionId, maximized, onToggleMax }) {
+export default function LivePanel({ sessionId, maximized, onToggleMax, running }) {
   const [mode, setMode] = useState(null)        // 'screencast' | 'iframe'
   const [iframeUrl, setIframeUrl] = useState(null)
   const [tabs, setTabs] = useState([])
@@ -152,11 +152,14 @@ export default function LivePanel({ sessionId, maximized, onToggleMax }) {
         )}
         {mode === 'screencast' && (frame ? (
           <div
-            className={'screen-wrap' + (isControlling ? ' driving' : '')}
+            className={'screen-wrap' + (isControlling ? ' driving' : (running ? ' agent-driving' : ''))}
             ref={boxRef} tabIndex={0} onKeyDown={onKeyDown}
             style={{ outline: 'none' }}
           >
             {isControlling && <div className="driving-banner">You are driving — scroll, click & type</div>}
+            {running && !isControlling && (
+              <div className="agent-banner"><span className="agent-banner-pulse" /> Agent is driving</div>
+            )}
             <img
               ref={imgRef}
               src={frame.url}

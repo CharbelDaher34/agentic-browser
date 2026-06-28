@@ -145,6 +145,73 @@ async def test_e2e_approval_auto_denied(tmp_path):
     assert len(result.approvals) >= 1     # the destructive click paused for approval
 
 
+async def test_e2e_unlabeled_coordinate_click_still_gates(tmp_path):
+    """A coordinate click on a real destructive button with NO label must still pause
+    for approval. The gate now classifies the element actually under (x, y) via a DOM
+    hit-test, so it no longer depends on the model-supplied label (which defaulted '' and
+    used to let destructive coordinate clicks through)."""
+    from agenticbrowser.agent import agent as orchestrator
+
+    page = tmp_path / "p.html"
+    page.write_text(
+        "<html><body style='margin:0'>"
+        "<form action='/checkout'>"
+        "<button type='submit' style='position:absolute;left:0;top:0;width:300px;height:60px'>"
+        "Place Order</button></form></body></html>"
+    )
+    url = page.as_uri()
+    model, _ = _scripted_model([
+        ("tool", "navigate", {"url": url}),
+        ("tool", "click_at", {"x": 150, "y": 30}),   # NO label — lands on "Place Order"
+        ("text", "STOPPED"),
+    ])
+
+    try:
+        with orchestrator.override(model=model):
+            async with BrowserAgent(keys={"anthropic": "sk-test"}, headless=True) as ab:
+                result = await ab.run("buy it")
+    except RuntimeError as exc:
+        if "Failed to open a browser" in str(exc):
+            pytest.skip(f"browser unavailable in this environment: {exc}")
+        raise
+
+    assert result.output == "STOPPED"
+    assert len(result.approvals) >= 1     # paused despite the model passing no label
+
+
+async def test_e2e_step_records_readable_target(tmp_path):
+    """A recorded step carries the human-readable name of the element acted on, so the
+    audit reads Clicked "Read more" instead of an opaque ref or raw coordinates."""
+    from agenticbrowser.agent import agent as orchestrator
+
+    page = tmp_path / "p.html"
+    page.write_text(
+        "<html><body style='margin:0'>"
+        "<a href='#x' style='position:absolute;left:0;top:0;width:300px;height:50px;"
+        "display:block'>Read more</a></body></html>"
+    )
+    url = page.as_uri()
+    model, _ = _scripted_model([
+        ("tool", "navigate", {"url": url}),
+        ("tool", "click_at", {"x": 150, "y": 25}),   # benign -> executes -> records a step
+        ("text", "DONE"),
+    ])
+
+    try:
+        with orchestrator.override(model=model):
+            async with BrowserAgent(keys={"anthropic": "sk-test"}, headless=True) as ab:
+                result = await ab.run("open it")
+    except RuntimeError as exc:
+        if "Failed to open a browser" in str(exc):
+            pytest.skip(f"browser unavailable in this environment: {exc}")
+        raise
+
+    assert result.output == "DONE"
+    clicks = [s for s in result.steps if s["action"]["kind"] == "click_at"]
+    assert clicks, "expected a recorded click_at step"
+    assert clicks[0]["action"].get("target") == "Read more"   # the resolved element name
+
+
 async def test_e2e_raising_approve_handler_does_not_hang(tmp_path):
     """A buggy approve= handler that raises must NOT hang the run (it should deny
     the action, fail-safe, and complete). asyncio.wait_for guards the test."""

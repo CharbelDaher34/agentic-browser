@@ -92,11 +92,15 @@ class Action:
     magnitude: int | None = None
     seconds: float | None = None
     clear: bool = True               # type_at: clear the field before typing
+    target: str | None = None        # human-readable name of the element acted on (the
+                                     # resolved DOM/hit-test element name) — for the audit
+                                     # + live trail, so "click_at (150,30)" reads as
+                                     # Clicked "Place Order".
 
     def to_json(self) -> dict:
         out: dict = {"kind": self.kind.value, "risk": self.risk.value}
         for k in ("ref", "text", "url", "x", "y", "x2", "y2", "keys", "direction",
-                  "submit", "magnitude", "seconds", "clear"):
+                  "submit", "magnitude", "seconds", "clear", "target"):
             v = getattr(self, k)
             if v is not None:
                 out[k] = v

@@ -76,44 +76,64 @@ export function AuthScreen() {
 
   return (
     <div className="auth-wrap">
-      <form className="auth-card" onSubmit={submit}>
-        <div className="auth-brand">
-          <div className="brand-mark" />
-          <div>
-            <div className="brand-name">Agentic Browser</div>
-            <div className="brand-sub">drive the web with an agent</div>
+      <div className="auth-stage">
+        <aside className="auth-showcase">
+          <div className="auth-brand">
+            <div className="brand-mark" />
+            <div>
+              <div className="brand-name">Agentic Browser</div>
+              <div className="brand-sub">drive the web with an agent</div>
+            </div>
           </div>
-          <div style={{ marginLeft: 'auto' }}><ThemeToggle /></div>
-        </div>
-        <div className="auth-title">{mode === 'login' ? 'Welcome back' : 'Create your account'}</div>
-        <div className="auth-sub">
-          {mode === 'login' ? 'Sign in to your sessions and chats.' : 'Start steering browsers with AI.'}
-        </div>
-        {err && <div className="auth-error">{err}</div>}
-        <div className="field">
-          <label>Username</label>
-          <input className="input" value={username} autoFocus
-            onChange={(e) => setUsername(e.target.value)} placeholder="ada" />
-        </div>
-        <div className="field">
-          <label>Password</label>
-          <input className="input" type="password" value={password}
-            onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
-        </div>
-        <button className="btn primary" style={{ width: '100%', justifyContent: 'center', marginTop: 6 }}
-          disabled={busy || !username || !password}>
-          {busy ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
-        </button>
-        {canRegister && (
-          <div className="auth-switch">
-            {mode === 'login' ? (
-              <>New here? <a onClick={() => { setMode('register'); setErr('') }}>Create an account</a></>
-            ) : (
-              <>Have an account? <a onClick={() => { setMode('login'); setErr('') }}>Sign in</a></>
-            )}
+          <h1 className="showcase-title">The web,<br />on autopilot.</h1>
+          <p className="showcase-sub">
+            Give an AI agent a goal and watch it navigate, click and type through a
+            real browser — with you in the loop for anything that matters.
+          </p>
+          <ul className="showcase-list">
+            <li><span className="sc-dot" /> Live screencast of every step</li>
+            <li><span className="sc-dot" /> Take over the browser any time</li>
+            <li><span className="sc-dot" /> Approval gates on destructive actions</li>
+            <li><span className="sc-dot" /> Full audit &amp; replay of each session</li>
+          </ul>
+        </aside>
+
+        <form className="auth-card" onSubmit={submit}>
+          <div className="auth-card-top">
+            <div>
+              <div className="auth-title">{mode === 'login' ? 'Welcome back' : 'Create your account'}</div>
+              <div className="auth-sub">
+                {mode === 'login' ? 'Sign in to your sessions and chats.' : 'Start steering browsers with AI.'}
+              </div>
+            </div>
+            <ThemeToggle />
           </div>
-        )}
-      </form>
+          {err && <div className="auth-error">{err}</div>}
+          <div className="field">
+            <label>Username</label>
+            <input className="input" value={username} autoFocus
+              onChange={(e) => setUsername(e.target.value)} placeholder="ada" />
+          </div>
+          <div className="field">
+            <label>Password</label>
+            <input className="input" type="password" value={password}
+              onChange={(e) => setPassword(e.target.value)} placeholder="••••••••" />
+          </div>
+          <button className="btn primary" style={{ width: '100%', justifyContent: 'center', marginTop: 8 }}
+            disabled={busy || !username || !password}>
+            {busy ? 'Please wait…' : mode === 'login' ? 'Sign in' : 'Create account'}
+          </button>
+          {canRegister && (
+            <div className="auth-switch">
+              {mode === 'login' ? (
+                <>New here? <a onClick={() => { setMode('register'); setErr('') }}>Create an account</a></>
+              ) : (
+                <>Have an account? <a onClick={() => { setMode('login'); setErr('') }}>Sign in</a></>
+              )}
+            </div>
+          )}
+        </form>
+      </div>
     </div>
   )
 }

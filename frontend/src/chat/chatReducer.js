@@ -109,11 +109,13 @@ export function chatReducer(state, action) {
       return { ...state, running: true, live: appendText(state.live, 'thinking', d.text || '') }
     case 'tool_call':
       return { ...state, running: true, live: [...state.live, { kind: 'tool_call', tool: d.tool, args: d.args }] }
-    case 'action':
+    case 'action': {
+      const tail = d.target ? ` “${d.target}”` : d.ref ? ` [${d.ref}]` : ''
       if (isSub(d)) {
-        return { ...state, subagents: patchSub(state.subagents, d.tab, { last: `▸ ${d.action}${d.ref ? ` [${d.ref}]` : ''}` }) }
+        return { ...state, subagents: patchSub(state.subagents, d.tab, { last: `▸ ${d.action}${tail}` }) }
       }
-      return { ...state, running: true, live: [...state.live, { kind: 'action', action: d.action, ref: d.ref }] }
+      return { ...state, running: true, live: [...state.live, { kind: 'action', action: d.action, ref: d.ref, target: d.target }] }
+    }
     case 'observation':
       if (isSub(d)) {
         return { ...state, subagents: patchSub(state.subagents, d.tab, { last: `↳ ${d.ok ? '✓' : '✗'} ${d.title || d.url || ''}` }) }

@@ -74,6 +74,36 @@ class AgentDeps:
 
 
 # ---- shared helpers --------------------------------------------------------
+def _action_phrase(a: Action) -> str:
+    """A short, human-readable description of an action — what was actually done and to
+    what (e.g. Clicked "Place Order"). Used for the audit/live trail and as feedback to
+    the model so a coordinate action confirms the element it landed on."""
+    tgt = f'"{a.target}"' if a.target else (f"[{a.ref}]" if a.ref else "")
+    k = a.kind
+    if k is ActionKind.NAVIGATE:
+        return f"Navigated to {a.url or ''}".strip()
+    if k in (ActionKind.CLICK, ActionKind.CLICK_AT):
+        return f"Clicked {tgt}" if tgt else f"Clicked at ({int(a.x or 0)}, {int(a.y or 0)})"
+    if k in (ActionKind.TYPE, ActionKind.TYPE_AT):
+        into = f" into {tgt}" if tgt else ""
+        return f'Typed "{a.text or ""}"{into}' + (" then Enter" if a.submit else "")
+    if k is ActionKind.SELECT:
+        return f'Selected "{a.text or ""}"' + (f" in {tgt}" if tgt else "")
+    if k in (ActionKind.SCROLL, ActionKind.SCROLL_AT):
+        return f"Scrolled {a.direction or 'down'}"
+    if k is ActionKind.KEY:
+        return f"Pressed {a.keys or ''}"
+    if k is ActionKind.DRAG:
+        return f"Dragged ({int(a.x or 0)},{int(a.y or 0)}) -> ({int(a.x2 or 0)},{int(a.y2 or 0)})"
+    if k is ActionKind.BACK:
+        return "Went back"
+    if k is ActionKind.FORWARD:
+        return "Went forward"
+    if k is ActionKind.WAIT:
+        return f"Waited {int(a.seconds or 0)}s"
+    return a.kind.value
+
+
 async def _run_action(
     ctx: RunContext[AgentDeps], action: Action, visual: bool = False
 ):
@@ -90,6 +120,7 @@ async def _run_action(
     await d.emit(
         StreamEvent("action", d.chat_id, {
             "action": action.kind.value, "ref": action.ref,
+            "target": action.target,
             "agent": d.label, "tab": d.tab_id,
         })
     )
@@ -119,7 +150,9 @@ async def _run_action(
     status = "ok" if result.ok else f"error: {result.error}"
     moved = "changed" if result.changed else "NO CHANGE — may be stuck"
     w, h = session.screen_size_of(d.tab_id)
-    text_out = f"[{status}; {moved}] {obs.url} (screen {w}x{h}px)\n{listing}"
+    # lead with a human-readable confirmation of what was done (and to what), so the
+    # model gets explicit feedback on the element it actually hit.
+    text_out = f"{_action_phrase(action)}\n[{status}; {moved}] {obs.url} (screen {w}x{h}px)\n{listing}"
     if visual:
         return ToolReturn(
             return_value=text_out,
@@ -145,19 +178,48 @@ def _gate(ctx: RunContext[AgentDeps], risk: Risk) -> str | None:
     return None
 
 
-# Whole-word matching (not substring) so benign text like "paypal", "resend", or
-# "sending" doesn't trip the gate while "pay"/"send" as actual words still do.
+# Destructive verbs. Whole-word matching (not substring) so benign text like "paypal"
+# or "sending" doesn't trip the gate. Multi-word phrases for the ambiguous ones so bare
+# "order"/"confirm"/"remove" don't over-trigger. These are matched against the element's
+# REAL name/text (see `_risk_for`) — never an opaque DOM ref or a model-supplied label.
 _DESTRUCTIVE_RE = re.compile(
-    r"\b(pay|buy|delete|send|confirm order|transfer|checkout)\b"
+    r"\b("
+    r"pay|buy|purchase|order now|place order|confirm order|complete (?:order|purchase|payment)|"
+    r"checkout|check out|"
+    r"delete|remove account|send|transfer|wire|withdraw|remit|"
+    r"unsubscribe|deactivate|terminate|close account|authori[sz]e payment|confirm payment"
+    r")\b"
 )
-_SENSITIVE_RE = re.compile(r"\b(submit|login)\b")
+_SENSITIVE_RE = re.compile(r"\b(submit|log ?in|sign ?in|book|reserve|subscribe)\b")
+# Escape-hatch labels — NEVER destructive, so the agent (or a human staring at a
+# destructive dialog) is never trapped by the gate on "Cancel"/"Close"/"No thanks".
+_SAFE_HATCH_RE = re.compile(r"\b(cancel|close|dismiss|go back|not now|keep|no thanks)\b")
+
+_RISK_ORDER = {Risk.SAFE: 0, Risk.SENSITIVE: 1, Risk.DESTRUCTIVE: 2}
 
 
-def _classify(kind: str, ref: str, text: str | None) -> Risk:
-    blob = f"{ref} {text or ''}".lower()
-    if _DESTRUCTIVE_RE.search(blob):
+def _max_risk(a: Risk, b: Risk) -> Risk:
+    """The more severe of two risks (model labels can only ESCALATE, never lower)."""
+    return a if _RISK_ORDER[a] >= _RISK_ORDER[b] else b
+
+
+def _risk_for(
+    *,
+    name: str = "",
+    input_type: str | None = None,
+    kind: str = "click",
+    text: str | None = None,
+) -> Risk:
+    """Classify an action's risk from GROUND-TRUTH facts — the resolved element's own
+    name/type (and the typed text), never an opaque ref or a model-supplied label.
+    `kind` is the action verb (click|type|select|key)."""
+    blob = f"{name} {text or ''}".lower().strip()
+    has_destructive = bool(_DESTRUCTIVE_RE.search(blob))
+    is_hatch = bool(_SAFE_HATCH_RE.search(blob)) and not has_destructive
+    if has_destructive and not is_hatch:
         return Risk.DESTRUCTIVE
-    if kind in ("type", "select") or _SENSITIVE_RE.search(blob):
+    sensitive_input = (input_type or "").lower() in ("password", "email", "tel")
+    if not is_hatch and (sensitive_input or kind in ("type", "select") or _SENSITIVE_RE.search(blob)):
         return Risk.SENSITIVE
     return Risk.SAFE
 
@@ -177,11 +239,16 @@ async def act(
     submit: bool = False,
 ) -> str:
     """Interact with element `ref`. kind in click|type|select|scroll."""
-    risk = _classify(kind, ref, text)
+    d = ctx.deps
+    # classify on the element's REAL name/type (resolved live from the DOM by ref),
+    # not the opaque ref string the model passes.
+    facts = await d.registry.get(d.session_id).describe_target(ref=ref, tab_id=d.tab_id)
+    risk = _risk_for(name=facts.get("name", ""), input_type=facts.get("input_type"), kind=kind, text=text)
     blocked = _gate(ctx, risk)
     if blocked:
         return blocked
-    a = Action(ActionKind(kind), risk, ref=ref, text=text, submit=submit)
+    a = Action(ActionKind(kind), risk, ref=ref, text=text, submit=submit,
+               target=facts.get("name") or None)
     return await _run_action(ctx, a)
 
 
@@ -214,13 +281,23 @@ async def click_at(
     """Click at pixel (x, y). Use for elements that have no ref (canvas, maps, icons).
 
     `label` = a short description of what you are clicking (e.g. 'Place order
-    button'). It lets the approval gate catch destructive coordinate clicks just
-    like the DOM `act` tool, so always set it when clicking buttons/links."""
-    risk = _classify("click", label, None)
+    button'). The approval gate decides risk from the actual element under (x, y);
+    `label` can only *raise* the risk it sees, so set it when clicking buttons/links."""
+    d = ctx.deps
+    # ground truth: hit-test the pixel and classify the REAL element under it. The
+    # model's `label` is folded in only as an escalator (it can raise risk, never lower
+    # it) — the safety decision never depends on a label that defaults to "".
+    facts = await d.registry.get(d.session_id).describe_target(x=x, y=y, tab_id=d.tab_id)
+    ground = _risk_for(name=facts.get("name", ""), input_type=facts.get("input_type"), kind="click")
+    risk = _max_risk(ground, _risk_for(name=label or "", kind="click"))
     blocked = _gate(ctx, risk)
     if blocked:
         return blocked
-    return await _run_action(ctx, Action(ActionKind.CLICK_AT, risk, x=x, y=y), visual=True)
+    return await _run_action(
+        ctx,
+        Action(ActionKind.CLICK_AT, risk, x=x, y=y, target=facts.get("name") or label or None),
+        visual=True,
+    )
 
 
 async def type_at(
@@ -232,13 +309,16 @@ async def type_at(
     clear: bool = True,
 ) -> ToolReturn | str:
     """Click at pixel (x, y) then type `text`. Set press_enter to submit."""
-    risk = _classify("type", "", text)
+    d = ctx.deps
+    facts = await d.registry.get(d.session_id).describe_target(x=x, y=y, tab_id=d.tab_id)
+    risk = _risk_for(name=facts.get("name", ""), input_type=facts.get("input_type"), kind="type", text=text)
     blocked = _gate(ctx, risk)
     if blocked:
         return blocked
     return await _run_action(
         ctx,
-        Action(ActionKind.TYPE_AT, risk, x=x, y=y, text=text, submit=press_enter, clear=clear),
+        Action(ActionKind.TYPE_AT, risk, x=x, y=y, text=text, submit=press_enter, clear=clear,
+               target=facts.get("name") or None),
         visual=True,
     )
 
@@ -272,7 +352,7 @@ async def drag(
 
 async def press_key(ctx: RunContext[AgentDeps], keys: str) -> ToolReturn | str:
     """Press a key or combination, e.g. 'Enter', 'Escape', 'Control+A'."""
-    risk = _classify("key", keys, None)
+    risk = _risk_for(name=keys, kind="key")
     blocked = _gate(ctx, risk)
     if blocked:
         return blocked

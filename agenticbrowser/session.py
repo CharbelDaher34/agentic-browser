@@ -66,6 +66,39 @@ _COLLECT_JS = """
 }
 """
 
+# Resolve the REAL element targeted by a DOM ref or by pixel coords, and return
+# ground-truth facts for the approval gate (the element's own text/role/type — never
+# an opaque ref or a model-supplied label). For coordinates we hit-test with
+# elementFromPoint and climb to the nearest interactive ancestor (so a click on the
+# <svg> inside a <button> still resolves the button).
+_DESCRIBE_JS = """
+(args) => {
+  const FAIL = {found:false, interactive:false, name:'', role:'', tag:'',
+                href:null, input_type:null, in_form:false};
+  const INTERACTIVE = new Set(['A','BUTTON','INPUT','SELECT','TEXTAREA','SUMMARY']);
+  const isInteractive = (n) => !!n && n.nodeType === 1 && (
+    INTERACTIVE.has(n.tagName) ||
+    (n.getAttribute && (n.getAttribute('role') === 'button' || n.getAttribute('role') === 'link')) ||
+    (n.hasAttribute && n.hasAttribute('onclick')));
+  let el = null;
+  if (args.ref) el = document.querySelector('[data-ref="' + args.ref + '"]');
+  else if (args.active) el = document.activeElement;
+  else if (args.x != null && args.y != null) el = document.elementFromPoint(args.x, args.y);
+  if (!el || el.nodeType !== 1) return FAIL;
+  let node = el, hops = 0, target = el;
+  while (node && hops < 6) { if (isInteractive(node)) { target = node; break; } node = node.parentElement; hops++; }
+  const tag = (target.tagName || '').toLowerCase();
+  const role = (target.getAttribute && target.getAttribute('role')) || tag;
+  const name = ((target.innerText || target.value ||
+                 (target.getAttribute && target.getAttribute('aria-label')) ||
+                 target.placeholder || '') + '').replace(/\\s+/g, ' ').trim().slice(0, 120);
+  const href = (target.getAttribute && target.getAttribute('href')) || null;
+  const input_type = (target.getAttribute && target.getAttribute('type')) || null;
+  const in_form = !!(target.closest && target.closest('form'));
+  return {found:true, interactive:isInteractive(target), name, role, tag, href, input_type, in_form};
+}
+"""
+
 
 @dataclass
 class _Tab:
@@ -299,6 +332,29 @@ class PlaywrightSession:
             text_digest=snap["text"],
             fingerprint=fp,
         )
+
+    async def describe_target(
+        self,
+        *,
+        ref: str | None = None,
+        x: int | None = None,
+        y: int | None = None,
+        active: bool = False,
+        tab_id: str | None = None,
+    ) -> dict:
+        """Ground-truth facts about the element an action will hit — resolved from the
+        live DOM by `ref` (DOM tools), by pixel coords (vision tools, via
+        `elementFromPoint`), or `active` (the focused element). Returns
+        `{found, interactive, name, role, tag, href, input_type, in_form}`. Best-effort:
+        any error → `found=False` (the gate treats that conservatively)."""
+        page = self._tab(tab_id).page
+        try:
+            return await page.evaluate(_DESCRIBE_JS, {"ref": ref, "x": x, "y": y, "active": active})
+        except Exception:  # noqa: BLE001 — never fail an action on gate introspection
+            return {
+                "found": False, "interactive": False, "name": "", "role": "",
+                "tag": "", "href": None, "input_type": None, "in_form": False,
+            }
 
     # ---- act + verify -------------------------------------------------------
     async def dispatch(

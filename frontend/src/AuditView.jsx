@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from './api.js'
-import { MarkdownText, shortArgs } from './chat/TurnTrail.jsx'
+import { MarkdownText, shortArgs, describeAction } from './chat/TurnTrail.jsx'
 import StepShot from './chat/StepShot.jsx'
 
 // Tools that perform a browser action and therefore record a screenshot step
@@ -85,8 +85,10 @@ function FlowItem({ it }) {
         {it.step && (
           <div className="flow-tool-shot">
             <StepShot step={it.step} />
-            <div className="flow-tool-cap mono">
-              step #{it.step.idx} · {it.step.result?.ok ? '✓' : '✗'} {it.step.result?.observation?.title || it.step.result?.observation?.url || ''}
+            <div className="flow-tool-cap">
+              <span className="mono">#{it.step.idx}</span> {describeAction(it.step.action)}{' '}
+              <span className={it.step.result?.ok ? 'ok' : 'bad'}>{it.step.result?.ok ? '✓' : '✗'}</span>
+              {it.step.result?.changed === false && <span className="faint"> · no change</span>}
             </div>
           </div>
         )}
@@ -137,7 +139,7 @@ function AuditStep({ step }) {
       <div className="audit-step-info">
         <div className="audit-step-h">
           <span className="audit-idx">#{step.idx}</span>
-          <span className="audit-action mono">{a.kind}</span>
+          <span className="audit-summary">{describeAction(a)}</span>
           {a.risk && a.risk !== 'safe' && <span className={'audit-risk ' + a.risk}>{a.risk}</span>}
           <span className={'audit-ok ' + (r.ok ? 'ok' : 'bad')}>{r.ok ? '✓ ok' : '✗ failed'}</span>
           {r.changed ? <span className="faint" style={{ fontSize: 11 }}>page changed</span> : <span className="faint" style={{ fontSize: 11 }}>no change</span>}

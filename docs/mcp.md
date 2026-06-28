@@ -57,8 +57,8 @@ async with my_agent:
 
 When the agent hits a destructive step (pay / buy / delete / send / checkout), the
 host is asked to approve via MCP **elicitation**. If the host can't elicit, the
-action is **auto-denied** (fail-safe) — set `BROWSER_AGENT_AUTO_APPROVE=true` to
-allow destructive actions in trusted/unattended setups instead.
+action is **auto-denied** (fail-safe). Destructive actions are never auto-approved —
+there is no env flag that bypasses the gate.
 
 ## Configuration (env)
 
@@ -72,7 +72,6 @@ allow destructive actions in trusted/unattended setups instead.
 | `BROWSER_AGENT_HEADLESS` | `true` | local backend headless |
 | `BROWSER_AGENT_SUBAGENTS` | `false` | allow parallel sub-agents |
 | `BROWSER_AGENT_MAX_STEPS` | — | budget: max tool steps per task |
-| `BROWSER_AGENT_AUTO_APPROVE` | `false` | approve destructive actions when the host can't elicit |
 | `BROWSER_AGENT_MCP_TRANSPORT` | `stdio` | `stdio`, `sse`, or `streamable-http` |
 
 ## Remote transport

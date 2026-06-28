@@ -10,8 +10,11 @@ artifacts/
 
 # frontend
 frontend/node_modules/
-# frontend/dist is intentionally NOT ignored: the gateway serves it single-origin
-# (SERVE_UI). Rebuild before deploying: cd frontend && npm run build
+# Build output — NOT committed (it churns hashed filenames on every build). It's
+# rebuilt on demand: `run.sh`/`make run` run `npm run build`, and the Docker image
+# builds it in its own stage (.dockerignore already excludes the committed copy).
+# Serving the gateway directly via uvicorn requires building it first.
+frontend/dist/
 
 # uv
 .python-version
