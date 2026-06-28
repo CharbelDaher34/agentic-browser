@@ -478,7 +478,14 @@ async def chat_ws(ws: WebSocket, chat_id: str):
     sender_task = asyncio.create_task(sender())
     try:
         while True:
-            msg = json.loads(await ws.receive_text())
+            try:
+                raw = await ws.receive_text()
+            except RuntimeError:
+                # Client vanished (page refresh / abrupt close): Starlette raises
+                # RuntimeError ("not connected"), not WebSocketDisconnect, when the
+                # socket is already torn down. Normalize so the same cleanup runs.
+                raise WebSocketDisconnect() from None
+            msg = json.loads(raw)
             kind = msg.get("kind")
             if kind == "user_message":
                 # start_turn INTERRUPTS any in-flight turn first (mid-run steering),
@@ -605,7 +612,15 @@ async def view_ws(ws: WebSocket, session_id: str):
 
     try:
         while True:
-            msg = json.loads(await ws.receive_text())
+            try:
+                raw = await ws.receive_text()
+            except RuntimeError:
+                # Client vanished (page refresh / abrupt close): Starlette raises
+                # RuntimeError ("not connected"), not WebSocketDisconnect, when the
+                # socket is already torn down. Normalize to a clean disconnect — the
+                # `finally` below still unsubscribes and releases any leases.
+                raise WebSocketDisconnect() from None
+            msg = json.loads(raw)
             kind = msg["kind"]
             tab_id = msg.get("tab_id") or sub["tab"] or "t0"
             if kind == "watch":

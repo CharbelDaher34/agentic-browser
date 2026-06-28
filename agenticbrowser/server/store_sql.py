@@ -117,6 +117,14 @@ class Message(SQLModel, table=True):
     __table_args__ = _TA
     chat_id: str = Field(primary_key=True, foreign_key="chats.chat_id", ondelete="CASCADE")
     blob: bytes = Field(sa_column=sa.Column(sa.LargeBinary, nullable=False))
+    # per-turn usage saved alongside the conversation (one entry per assistant
+    # turn, in order) so the per-message footer + session total survive a reload.
+    # Streamed live via the `usage` event but embedded client-side, so it's lost
+    # on refresh unless persisted here, on the message record itself.
+    usage: list = Field(
+        default_factory=list,
+        sa_column=sa.Column(JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")),
+    )
     updated_at: Optional[datetime] = Field(default=None, sa_column=_ts_col())
 
 
@@ -214,6 +222,9 @@ class Store:
             )
             await conn.execute(
                 sa.text("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS bb_session_id TEXT")
+            )
+            await conn.execute(
+                sa.text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS usage JSONB NOT NULL DEFAULT '[]'::jsonb")
             )
         return cls(engine)
 
@@ -461,6 +472,28 @@ class Store:
             return []
         return ModelMessagesTypeAdapter.validate_json(bytes(r))
 
+    async def append_turn_usage(self, chat_id: str, usage: dict) -> None:
+        """Append one assistant turn's usage onto its chat's message record (the
+        `messages.usage` list), in order — saved with the conversation, not in a
+        separate table. save_messages always runs first (and its on-conflict update
+        leaves `usage` untouched), so the row exists and the list accumulates across
+        turns. Turns for a chat run one at a time, so this read-modify-write is safe."""
+        async with self._sm() as s:
+            row = (
+                await s.execute(select(Message).where(Message.chat_id == chat_id))
+            ).scalars().first()
+            if row is None:   # guard — save_messages should have created the row
+                return
+            row.usage = list(row.usage or []) + [dict(usage)]
+            await s.commit()
+
+    async def load_turn_usage(self, chat_id: str) -> list[dict]:
+        async with self._sm() as s:
+            r = (
+                await s.execute(select(Message.usage).where(Message.chat_id == chat_id))
+            ).scalars().first()
+        return list(r or [])
+
     async def export_messages(self, chat_id: str) -> list[dict]:
         """Decode message history into a render-friendly transcript for the UI.
 
@@ -514,6 +547,15 @@ class Store:
                         turn.append(it)
                         call_index[it["tool_call_id"]] = it
         flush()  # trailing assistant turn
+        # Attach persisted per-turn usage to assistant turns, in order, so the
+        # per-message footer and the session total survive a reload (see TurnUsage).
+        # Pre-fix chats (no usage rows) simply render without a usage footer.
+        usage_rows = await self.load_turn_usage(chat_id)
+        ui = 0
+        for m in out:
+            if m["role"] == "assistant" and ui < len(usage_rows):
+                m["usage"] = usage_rows[ui]
+                ui += 1
         return out
 
     # ---- steps (Recorder sink) ---------------------------------------------

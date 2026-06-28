@@ -242,7 +242,14 @@ class Runner:
                     await self.store.save_storage_state(session_id, state, last_url=sess.url)
                 except Exception:  # noqa: BLE001
                     pass
-                await emit(StreamEvent("usage", chat_id, _usage_payload()))
+                turn_usage = _usage_payload()
+                # persist the turn's usage so it survives a reload — the streamed
+                # `usage` event is embedded client-side but lost on refresh.
+                try:
+                    await self.store.append_turn_usage(chat_id, turn_usage)
+                except Exception:  # noqa: BLE001 — never fail a turn on usage accounting
+                    log.warning("persisting turn usage failed for chat %s", chat_id, exc_info=True)
+                await emit(StreamEvent("usage", chat_id, turn_usage))
                 await emit(StreamEvent("final", chat_id, {"text": result.output}))
                 return result.output
         except asyncio.CancelledError:
@@ -250,12 +257,16 @@ class Runner:
             # partial context: persist what the assistant produced so far + an
             # interruption marker so the next turn builds on it. Shield the save so
             # the cancellation that's unwinding us doesn't abort the write.
+            partial_usage = _usage_payload()
             try:
+                # persist the partial assistant turn AND its usage together so the
+                # stored usage rows stay aligned 1:1 with persisted assistant turns.
                 await asyncio.shield(self._persist_partial(chat_id, history, prompt, acc))
+                await asyncio.shield(self.store.append_turn_usage(chat_id, partial_usage))
             except Exception:  # noqa: BLE001
                 pass
             try:
-                await emit(StreamEvent("usage", chat_id, _usage_payload()))
+                await emit(StreamEvent("usage", chat_id, partial_usage))
             except Exception:  # noqa: BLE001 — never block the unwind on usage
                 pass
             await emit(StreamEvent("interrupted", chat_id, {"text": acc.text_blob()}))

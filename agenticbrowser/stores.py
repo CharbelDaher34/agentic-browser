@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The `Store` Protocol the agent CORE depends on, plus zero-server impls.
 
-The core (registry / runner / recorder) only ever calls the 11 methods below —
+The core (registry / runner / recorder) only ever calls the 12 methods below —
 verified by grep over those modules. By depending on this narrow Protocol instead
 of the concrete SQLModel/Postgres class, the agent runs headless with no database.
 Keys are never a store concern — they live in `CoreConfig`.
@@ -28,7 +28,7 @@ from .models import StepRecord
 
 @runtime_checkable
 class Store(Protocol):
-    """The 11 methods the agent core actually calls.
+    """The 12 methods the agent core actually calls.
 
     Keys are NOT a Store concern: provider API keys + Browserbase creds come from
     `CoreConfig` (the SDK's `keys=`/`browserbase=`, or the server's .env), never from
@@ -48,6 +48,9 @@ class Store(Protocol):
     # --- conversation (runner) ---
     async def load_messages(self, chat_id: str) -> list[ModelMessage]: ...
     async def save_messages(self, chat_id: str, messages: list[ModelMessage]) -> None: ...
+    # one entry per assistant turn, appended in order and saved with the
+    # conversation so per-message + session usage survive a reload.
+    async def append_turn_usage(self, chat_id: str, usage: dict) -> None: ...
     async def max_step_idx(self, chat_id: str) -> int: ...
     # --- replay trail (recorder) ---
     async def insert_step(self, rec: StepRecord) -> None: ...
@@ -65,6 +68,7 @@ class MemoryStore:
         self._bb_id: dict[str, str | None] = {}
         self._sessions: dict[str, dict] = {}
         self._messages: dict[str, list[ModelMessage]] = {}
+        self._usage: dict[str, list[dict]] = {}
         self._steps: dict[str, list[StepRecord]] = {}
 
     async def load_storage_state(self, session_id):
@@ -95,6 +99,12 @@ class MemoryStore:
 
     async def save_messages(self, chat_id, messages):
         self._messages[chat_id] = list(messages)
+
+    async def append_turn_usage(self, chat_id, usage):
+        self._usage.setdefault(chat_id, []).append(dict(usage))
+
+    async def load_turn_usage(self, chat_id) -> list[dict]:
+        return list(self._usage.get(chat_id, []))
 
     async def max_step_idx(self, chat_id):
         return max((s.idx for s in self._steps.get(chat_id, [])), default=0)
@@ -147,13 +157,22 @@ class SqliteStore:
                   session_id TEXT PRIMARY KEY, provider TEXT,
                   storage_state TEXT, last_url TEXT, bb_session_id TEXT);
                 CREATE TABLE IF NOT EXISTS messages (
-                  chat_id TEXT PRIMARY KEY, blob BLOB);
+                  chat_id TEXT PRIMARY KEY, blob BLOB,
+                  usage TEXT NOT NULL DEFAULT '[]');
                 CREATE TABLE IF NOT EXISTS steps (
                   chat_id TEXT, idx INTEGER, action TEXT, ok INTEGER,
                   changed INTEGER, url TEXT, screenshot_uri TEXT,
                   PRIMARY KEY (chat_id, idx));
                 """
             )
+            # add `usage` to message tables created before it existed (CREATE IF
+            # NOT EXISTS above can't alter an existing table). No-op if present.
+            try:
+                await self._conn.execute(
+                    "ALTER TABLE messages ADD COLUMN usage TEXT NOT NULL DEFAULT '[]'"
+                )
+            except Exception:  # noqa: BLE001 — column already exists
+                pass
             await self._conn.commit()
         return self._conn
 
@@ -227,12 +246,29 @@ class SqliteStore:
     async def save_messages(self, chat_id, messages):
         db = await self._db()
         blob = ModelMessagesTypeAdapter.dump_json(messages)
+        # leave `usage` untouched on conflict (it accumulates across turns); a new
+        # row defaults it to '[]'.
         await db.execute(
             """INSERT INTO messages (chat_id, blob) VALUES (?, ?)
                ON CONFLICT(chat_id) DO UPDATE SET blob=excluded.blob""",
             (chat_id, blob),
         )
         await db.commit()
+
+    async def append_turn_usage(self, chat_id, usage):
+        db = await self._db()
+        # save_messages always runs first, so the row exists; append to its list.
+        raw = await self._scalar("SELECT usage FROM messages WHERE chat_id=?", (chat_id,))
+        lst = json.loads(raw) if raw else []
+        lst.append(dict(usage))
+        await db.execute(
+            "UPDATE messages SET usage=? WHERE chat_id=?", (json.dumps(lst), chat_id)
+        )
+        await db.commit()
+
+    async def load_turn_usage(self, chat_id) -> list[dict]:
+        raw = await self._scalar("SELECT usage FROM messages WHERE chat_id=?", (chat_id,))
+        return json.loads(raw) if raw else []
 
     async def max_step_idx(self, chat_id):
         v = await self._scalar("SELECT MAX(idx) FROM steps WHERE chat_id=?", (chat_id,))
