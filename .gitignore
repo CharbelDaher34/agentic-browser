@@ -24,3 +24,6 @@ computers/
 # ...but DO track the documented template
 !.env.example
 node_modules/
+
+# kept local, not in the repo
+LINKEDIN_POST.md
