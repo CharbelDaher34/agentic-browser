@@ -9,7 +9,11 @@ export function MarkdownText({ text }) {
     <div className="md">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{ a: (p) => <a {...p} target="_blank" rel="noreferrer" /> }}
+        components={{
+          a: (p) => <a {...p} target="_blank" rel="noreferrer" />,
+          // wide tables (price comparisons etc.) scroll inside the bubble instead of overflowing the rail
+          table: ({ node, ...p }) => <div className="table-wrap"><table {...p} /></div>,
+        }}
       >
         {text || ''}
       </ReactMarkdown>

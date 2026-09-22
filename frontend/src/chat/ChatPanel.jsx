@@ -7,7 +7,7 @@ import { UsageLine } from './usage.jsx'
 
 // Presentational: the chat WS + state live in the `session` (useChat) owned by
 // Workspace, so the socket survives while this panel is hidden in full-screen.
-export default function ChatPanel({ chat, session }) {
+export default function ChatPanel({ chat, session, wide, onToggleWide, onClose }) {
   const { state, connected, steps, send, stop } = session
   const [audit, setAudit] = useState(false)
   const scrollRef = useRef(null)
@@ -29,6 +29,14 @@ export default function ChatPanel({ chat, session }) {
           <span className={'dot' + (connected ? ' live' : '')} />
           {connected ? (state.running ? 'agent working' : 'connected') : 'connecting…'}
         </span>
+        {onToggleWide && (
+          <button className="icon-btn" onClick={onToggleWide} title={wide ? 'Narrow' : 'Widen'} aria-label={wide ? 'Narrow chat' : 'Widen chat'}>
+            {wide ? '⤡' : '⤢'}
+          </button>
+        )}
+        {onClose && (
+          <button className="icon-btn" onClick={onClose} title="Hide chat (Esc)" aria-label="Hide chat">›</button>
+        )}
       </header>
 
       <div className="transcript" ref={scrollRef}>

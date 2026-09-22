@@ -2,22 +2,24 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api.js'
 import { useAuth } from './auth.jsx'
 import { ThemeToggle } from './theme.jsx'
-import ChatPanel from './chat/ChatPanel.jsx'
+import ChatDock from './chat/ChatDock.jsx'
 import LivePanel from './live/LivePanel.jsx'
 import { useChat } from './chat/useChat.js'
 import { sumUsage } from './chat/chatReducer.js'
 import { SessionUsagePill } from './chat/usage.jsx'
 import ApprovalModal from './chat/ApprovalModal.jsx'
-import MiniChat from './chat/MiniChat.jsx'
 
 // Single-session UI: every user works in ONE browser session (the backend still
 // supports many). We use the user's existing session, or silently create one at
 // startup. Provider keys come from the server's env (no per-session key setup).
 //
-// Layout ("Browser hero + chat rail"): a slim top bar carries identity, the
-// always-on session usage and browser status. Below it the live browser is the
-// dominant canvas (left) and the conversation is a focused rail (right). The chat
-// list lives in a slide-in drawer opened from the top bar.
+// There is NO landing page: on load we open the last chat, else the most recent
+// one, else create one — the user always lands directly in the workspace.
+//
+// Layout: a slim top bar carries identity, the always-on session usage and
+// browser status. Below it the live browser owns the whole stage; the
+// conversation sits in a collapsible side panel with a launcher bubble
+// (bottom-right). The chat list lives in a slide-in drawer.
 export default function Workspace() {
   const { user, logout } = useAuth()
   const [session, setSession] = useState(null)   // the single browser session
@@ -33,9 +35,11 @@ export default function Workspace() {
       else localStorage.removeItem('ab_selected')
     } catch {}
   }
-  const [maxLive, setMaxLive] = useState(false)   // live browser fills the workspace
   const [drawerOpen, setDrawerOpen] = useState(false)
-  const creatingRef = useRef(false)               // guard against double auto-create
+  const [bootTry, setBootTry] = useState(0)       // bumped to retry a failed boot
+  const bootRef = useRef(false)                   // guard against concurrent boots
+  const selectedRef = useRef(selected)            // latest selection, readable from effects
+  useEffect(() => { selectedRef.current = selected }, [selected])
   const chatSession = useChat(selected)
 
   const refresh = useCallback(async () => {
@@ -53,31 +57,62 @@ export default function Workspace() {
         }
         return sel
       })
-      return sess
-    } catch { return null }
+      return { sess, chatList }
+    } catch { return { sess: null, chatList: [] } }
   }, [])
 
-  // Ensure exactly one browser session exists at start; silently create one if
-  // none (provider keys come from the server's env — no setup prompt needed).
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      const sess = await refresh()
-      if (cancelled || sess || creatingRef.current) return
-      creatingRef.current = true
-      try { await api.createSession({ name: 'Session' }); await refresh() }
-      catch {} finally { creatingRef.current = false }
-    })()
-    return () => { cancelled = true }
+  const createChat = useCallback(async (sessionId, title) => {
+    const r = await api.createChat(sessionId, title)
+    await refresh()
+    setSelected({ chat_id: r.chat_id, session_id: sessionId, title: r.title })
+    return r
   }, [refresh])
+
+  // Load the session + chat list once on mount. This also validates a selection
+  // restored from localStorage: refresh() drops one whose chat is gone, which
+  // then hands the boot effect below a clean slate.
+  useEffect(() => { refresh() }, [refresh])
+
+  // Boot straight into the workspace — there is no landing page. Make sure a
+  // browser session exists (created silently; provider keys come from the
+  // server's env), then open the most recent chat, or create one.
+  //
+  // Runs whenever nothing is selected, so it also self-heals a stale restored
+  // selection. `bootRef` only guards CONCURRENT runs — deliberately not an
+  // abort-on-cleanup flag, which under StrictMode's double-mount would cancel
+  // the only boot and strand the user on the loading state.
+  const needsChat = !selected
+  useEffect(() => {
+    if (!needsChat || bootRef.current) return
+    bootRef.current = true
+    ;(async () => {
+      try {
+        let { sess, chatList } = await refresh()
+        if (!sess) {
+          await api.createSession({ name: 'Session' })
+          ;({ sess, chatList } = await refresh())
+          if (!sess) throw new Error('no session')
+        }
+        const mine = chatList.filter((c) => c.session_id === sess.session_id)
+        if (selectedRef.current) return          // a selection landed meanwhile
+        if (mine.length > 0) {
+          const c = mine[0]                      // list is newest-first
+          setSelected({ chat_id: c.chat_id, session_id: c.session_id, title: c.title })
+        } else {
+          await createChat(sess.session_id, 'New chat')
+        }
+      } catch {
+        // server hiccup — back off and try again rather than dead-ending
+        setTimeout(() => setBootTry((n) => n + 1), 3000)
+      } finally { bootRef.current = false }
+    })()
+  }, [needsChat, bootTry, refresh, createChat])
 
   const newChat = async () => {
     if (!session) return
     const title = prompt('Chat title', 'New chat')
     if (title === null) return
-    const r = await api.createChat(session.session_id, title || 'New chat')
-    await refresh()
-    setSelected({ chat_id: r.chat_id, session_id: session.session_id, title: r.title })
+    await createChat(session.session_id, title || 'New chat')
     setDrawerOpen(false)
   }
 
@@ -118,26 +153,22 @@ export default function Workspace() {
 
       <main className="stage">
         {selected ? (
-          <div className={'workspace' + (maxLive ? ' max-live' : '')}>
+          <div className="workspace">
             <div className="canvas">
               <LivePanel
                 key={selected.session_id}
                 sessionId={selected.session_id}
-                maximized={maxLive}
-                onToggleMax={() => setMaxLive((v) => !v)}
                 running={chatSession.state.running}
               />
             </div>
-            {!maxLive && (
-              <div className="rail">
-                <ChatPanel key={selected.chat_id} chat={selected} session={chatSession} />
-              </div>
-            )}
-            {maxLive && <MiniChat session={chatSession} />}
+            <ChatDock chat={selected} session={chatSession} />
             <ApprovalModal approval={chatSession.state.approval} onResolve={chatSession.resolveApproval} />
           </div>
         ) : (
-          <EmptyState session={session} onNew={newChat} />
+          <div className="booting">
+            <span className="booting-dot" />
+            {session ? 'Opening your chat…' : 'Starting your browser session…'}
+          </div>
         )}
       </main>
 
@@ -202,40 +233,6 @@ function ChatsDrawer({ open, onClose, chats, session, selected, onSelect, onNew 
           ))}
         </div>
       </aside>
-    </div>
-  )
-}
-
-const CAPABILITIES = [
-  { ic: '🔎', t: 'Research & synthesize', d: 'Browse multiple sources and bring back one clear answer.' },
-  { ic: '🧾', t: 'Fill forms & checkout', d: 'Complete multi-step flows — with approval on risky actions.' },
-  { ic: '📊', t: 'Extract structured data', d: 'Pull tables, prices and listings straight off any page.' },
-  { ic: '🛰️', t: 'Automate workflows', d: 'Chain tabs and sub-agents to finish the whole job.' },
-]
-
-function EmptyState({ session, onNew }) {
-  return (
-    <div className="hero">
-      <div className="hero-glow" />
-      <div className="hero-mark"><div className="brand-mark" /></div>
-      <div className="hero-eyebrow">Agentic Browser</div>
-      <h1 className="hero-title">Put the agent to work</h1>
-      <p className="hero-sub">
-        Start a chat and watch it drive a real browser — live, step by step.
-        You stay in control and can take over any time.
-      </p>
-      <div className="hero-cards">
-        {CAPABILITIES.map((c) => (
-          <div className="hero-card" key={c.t}>
-            <div className="hero-card-ic">{c.ic}</div>
-            <div className="hero-card-t">{c.t}</div>
-            <div className="hero-card-d">{c.d}</div>
-          </div>
-        ))}
-      </div>
-      <button className="btn primary hero-cta" onClick={onNew} disabled={!session}>
-        {session ? '+  Start a new chat' : 'Setting up session…'}
-      </button>
     </div>
   )
 }

@@ -70,8 +70,13 @@ class Settings(BaseSettings):
     # (set false for a pure API deployment).
     serve_ui: bool = True
 
-    # screencast / live-view tuning
-    screencast_quality: int = 60
+    # screencast / live-view tuning (see CoreConfig for what each does)
+    viewport_width: int = 1600
+    viewport_height: int = 1000
+    agent_image_width: int = 1280
+    screencast_sharp_scale: float = 1.5
+    screencast_sharpen_delay: float = 0.35
+    screencast_quality: int = 80
     screencast_every_nth_frame: int = 1
     screencast_max_width: int | None = None
     screencast_max_height: int | None = None
@@ -112,6 +117,11 @@ class Settings(BaseSettings):
             max_concurrent_subagents=self.max_concurrent_subagents,
             max_tabs=self.max_tabs,
             idle_ttl_seconds=self.idle_ttl_seconds,
+            viewport_width=self.viewport_width,
+            viewport_height=self.viewport_height,
+            agent_image_width=self.agent_image_width,
+            screencast_sharp_scale=self.screencast_sharp_scale,
+            screencast_sharpen_delay=self.screencast_sharpen_delay,
             screencast_quality=self.screencast_quality,
             screencast_every_nth_frame=self.screencast_every_nth_frame,
             screencast_max_width=self.screencast_max_width,

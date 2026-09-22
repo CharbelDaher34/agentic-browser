@@ -4,18 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agentic Browser — drive the web with an agent</title>
-    <meta name="color-scheme" content="dark light" />
+    <meta name="color-scheme" content="light dark" />
     <!-- Set the theme before first paint to avoid a flash of the wrong theme. -->
     <script>
       (function () {
         try {
           var t = localStorage.getItem('ab_theme');
-          if (!t) {
-            t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-          }
-          document.documentElement.dataset.theme = t;
+          // Default to the white (light) theme; users can switch to dark from the top bar.
+          document.documentElement.dataset.theme = t === 'dark' ? 'dark' : 'light';
         } catch (e) {
-          document.documentElement.dataset.theme = 'dark';
+          document.documentElement.dataset.theme = 'light';
         }
       })();
     </script>

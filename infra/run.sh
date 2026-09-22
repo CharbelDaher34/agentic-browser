@@ -174,8 +174,11 @@ fi
 
 RELOAD=""; [ "$DEV" = "1" ] && RELOAD="--reload"
 log "Starting backend → http://$BACKEND_HOST:$BACKEND_PORT"
+# --ws websockets-sansio: uvicorn's default picks the deprecated websockets.legacy
+# stack, whose keepalive-ping task drains the socket concurrently with our
+# screencast sender and trips an AssertionError under backpressure (see Dockerfile).
 PYTHONPATH="$PWD" uv run uvicorn agenticbrowser.server.gateway:app \
-  --host "$BACKEND_HOST" --port "$BACKEND_PORT" $RELOAD &
+  --host "$BACKEND_HOST" --port "$BACKEND_PORT" --ws websockets-sansio $RELOAD &
 PIDS+=($!)
 
 if [ "$DEV" = "1" ] && [ "$BACKEND_ONLY" != "1" ]; then

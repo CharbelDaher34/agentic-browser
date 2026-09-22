@@ -48,7 +48,23 @@ class CoreConfig:
 
     # --- session lifecycle / live-view tuning ---
     idle_ttl_seconds: int = 30 * 60
-    screencast_quality: int = 60
+    # Browser viewport (CSS px) for the LOCAL provider. The CDP screencast emits
+    # frames at exactly this size, so pick it to match the live-view stage and
+    # the frames need no upscaling. The agent is decoupled from it: it always
+    # sees screenshots `agent_image_width` px wide and acts in that coordinate
+    # space (Session scales coordinates both ways), so a bigger viewport costs
+    # no model tokens and changes no click precision. Browserbase keeps 1280x800.
+    viewport_width: int = 1600
+    viewport_height: int = 1000
+    agent_image_width: int = 1280
+
+    # Live-view sharpness on HiDPI viewers: once a tab has been idle for
+    # `screencast_sharpen_delay` seconds we push ONE extra frame captured at
+    # `screencast_sharp_scale`x the viewport — crisp while the user is actually
+    # reading, cheap while things move. 1.0 disables it.
+    screencast_sharp_scale: float = 1.5
+    screencast_sharpen_delay: float = 0.35
+    screencast_quality: int = 80
     screencast_every_nth_frame: int = 1
     screencast_max_width: int | None = None
     screencast_max_height: int | None = None

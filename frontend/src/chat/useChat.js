@@ -4,7 +4,7 @@ import { chatReducer, initialChat } from './chatReducer.js'
 
 // Owns the chat WebSocket + reducer for the selected chat. Lifted out of ChatPanel
 // so the socket is single and stays alive whether or not ChatPanel is visible
-// (e.g. while the live view is maximized and a MiniChat consumes the same session).
+// (e.g. while the floating chat dock is closed, the agent keeps streaming into it).
 export function useChat(chat) {
   const [state, dispatch] = useReducer(chatReducer, initialChat)
   const [connected, setConnected] = useState(false)

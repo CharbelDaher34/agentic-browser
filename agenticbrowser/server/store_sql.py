@@ -196,7 +196,7 @@ class Store:
         # hostname verification, so disable verification (still encrypted — this
         # is equivalent to libpq sslmode=require). create_default_context() would
         # raise ssl.SSLCertVerificationError on connect and crash startup.
-        if not any(h in dsn for h in ("@localhost", "@127.0.0.1")):
+        if not any(h in dsn for h in ("@localhost", "@127.0.0.1", "@postgres:")):
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE

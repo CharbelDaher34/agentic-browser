@@ -109,6 +109,13 @@ class _Tab:
     label: str = ""
     streaming: bool = False
     subs: set = field(default_factory=set)
+    # sharpen-on-idle state (see _sharpen): the last 1x frame we forwarded, the
+    # echo-hold window after a sharp push, the newest 1x frame held in it, and
+    # the pending idle task.
+    last_frame: str | None = None
+    hold_until: float = 0.0
+    held: str | None = None
+    sharpen_task: asyncio.Task | None = None
     # serializes an action's perform+observe against the popup adopt path so the
     # page isn't mutated mid-flight. observe() must NOT take this lock —
     # dispatch() holds it while calling observe(), and asyncio.Lock isn't reentrant.
@@ -164,13 +171,35 @@ class PlaywrightSession:
         """Primary page — compat shim for callers that reach in directly."""
         return self._tab(None).page
 
-    def screen_size_of(self, tab_id: str | None = None) -> tuple[int, int]:
-        """Pixel size of the tab's screenshot / coordinate space."""
-        try:
-            vs = self._tab(tab_id).page.viewport_size
-        except KeyError:
-            vs = None
+    # ---- coordinate spaces ---------------------------------------------------
+    # The browser viewport can be larger than what the agent sees. Everything
+    # that leaves the session (screenshots, screen_size_of, frame headers) is in
+    # AGENT space (`agent_image_width` px wide); everything that enters with
+    # coordinates (actions, take-over input, describe) is converted back to PAGE
+    # space with `_to_page`. Only possible with a CDP session (local provider);
+    # otherwise the two spaces are the same.
+    def _viewport_of(self, tab: _Tab) -> tuple[int, int]:
+        vs = tab.page.viewport_size
         return (vs["width"], vs["height"]) if vs else (1280, 800)
+
+    def _agent_scale(self, tab: _Tab) -> float:
+        if tab.cdp is None:
+            return 1.0
+        w, _ = self._viewport_of(tab)
+        return min(1.0, self._cfg.agent_image_width / w) if w else 1.0
+
+    def _to_page(self, tab: _Tab, v: float | None) -> float:
+        return (v or 0) / self._agent_scale(tab)
+
+    def screen_size_of(self, tab_id: str | None = None) -> tuple[int, int]:
+        """Pixel size of the tab's screenshot / agent coordinate space."""
+        try:
+            tab = self._tab(tab_id)
+        except KeyError:
+            return (1280, 800)
+        w, h = self._viewport_of(tab)
+        s = self._agent_scale(tab)
+        return (round(w * s), round(h * s))
 
     @property
     def screen_size(self) -> tuple[int, int]:
@@ -236,6 +265,7 @@ class PlaywrightSession:
             return  # never close the primary tab
         tab = self._tabs.pop(tab_id)
         tab.streaming = False
+        self._cancel_sharpen(tab)
         try:
             await tab.page.close()
         except Exception:  # noqa: BLE001
@@ -347,9 +377,11 @@ class PlaywrightSession:
         `elementFromPoint`), or `active` (the focused element). Returns
         `{found, interactive, name, role, tag, href, input_type, in_form}`. Best-effort:
         any error → `found=False` (the gate treats that conservatively)."""
-        page = self._tab(tab_id).page
+        tab = self._tab(tab_id)
+        if x is not None and y is not None:
+            x, y = self._to_page(tab, x), self._to_page(tab, y)
         try:
-            return await page.evaluate(_DESCRIBE_JS, {"ref": ref, "x": x, "y": y, "active": active})
+            return await tab.page.evaluate(_DESCRIBE_JS, {"ref": ref, "x": x, "y": y, "active": active})
         except Exception:  # noqa: BLE001 — never fail an action on gate introspection
             return {
                 "found": False, "interactive": False, "name": "", "role": "",
@@ -376,6 +408,9 @@ class PlaywrightSession:
 
     async def _perform(self, a: Action, tab: _Tab) -> None:
         page = tab.page
+        # coordinate actions arrive in agent space
+        x, y = self._to_page(tab, a.x), self._to_page(tab, a.y)
+        x2, y2 = self._to_page(tab, a.x2), self._to_page(tab, a.y2)
         # ---- DOM-ref based ----
         if a.kind is ActionKind.NAVIGATE and a.url:
             await page.goto(a.url)
@@ -392,9 +427,9 @@ class PlaywrightSession:
             await page.mouse.wheel(0, 600)
         # ---- vision / coordinate based ----
         elif a.kind is ActionKind.CLICK_AT:
-            await page.mouse.click(a.x or 0, a.y or 0)
+            await page.mouse.click(x, y)
         elif a.kind is ActionKind.TYPE_AT:
-            await page.mouse.click(a.x or 0, a.y or 0)
+            await page.mouse.click(x, y)
             if a.clear:
                 await self._key_combination(["ControlOrMeta", "a"], tab)
                 await page.keyboard.press("Delete")
@@ -402,7 +437,7 @@ class PlaywrightSession:
             if a.submit:
                 await page.keyboard.press("Enter")
         elif a.kind is ActionKind.SCROLL_AT:
-            await page.mouse.move(a.x or 0, a.y or 0)
+            await page.mouse.move(x, y)
             mag = a.magnitude or 600
             dx, dy = {
                 "up": (0, -mag), "down": (0, mag),
@@ -410,9 +445,9 @@ class PlaywrightSession:
             }.get(a.direction or "down", (0, mag))
             await page.mouse.wheel(dx, dy)
         elif a.kind is ActionKind.DRAG:
-            await page.mouse.move(a.x or 0, a.y or 0)
+            await page.mouse.move(x, y)
             await page.mouse.down()
-            await page.mouse.move(a.x2 or 0, a.y2 or 0)
+            await page.mouse.move(x2, y2)
             await page.mouse.up()
         elif a.kind is ActionKind.KEY and a.keys:
             await self._key_combination([p for p in a.keys.split("+") if p], tab)
@@ -440,19 +475,37 @@ class PlaywrightSession:
             pass
 
     async def screenshot(self, tab_id: str | None = None) -> bytes:
-        return await self._tab(tab_id).page.screenshot()
+        """PNG of the viewport in AGENT space (`agent_image_width` px wide), so the
+        image the model sees is exactly the coordinate space it acts in."""
+        tab = self._tab(tab_id)
+        s = self._agent_scale(tab)
+        if tab.cdp is not None and s < 1.0:
+            w, h = self._viewport_of(tab)
+            try:
+                r = await tab.cdp.send("Page.captureScreenshot", {
+                    "format": "png",
+                    "clip": {"x": 0, "y": 0, "width": w, "height": h, "scale": s},
+                })
+                return base64.b64decode(r["data"])
+            except Exception:  # noqa: BLE001 — fall through to playwright
+                pass
+        return await tab.page.screenshot(scale="css")
 
     async def frame_jpeg_b64(self, tab_id: str | None = None) -> str | None:
         """A base64 JPEG of the tab right now — used to hand a freshly-connected
         viewer the current page immediately (the CDP screencast only emits frames
-        on repaint, so a viewer of a static page would otherwise see nothing)."""
+        on repaint, so a viewer of a static page would otherwise see nothing).
+        Captured sharp (see _capture_sharp) since the page is static by definition."""
+        tab = self._tab(tab_id)
+        if tab.cdp is not None:
+            data = await self._capture_sharp(tab)
+            if data is not None:
+                return data
         try:
-            data = await self._tab(tab_id).page.screenshot(
-                type="jpeg", quality=self._cfg.screencast_quality
-            )
+            raw = await tab.page.screenshot(type="jpeg", quality=self._cfg.screencast_quality)
         except Exception:  # noqa: BLE001
             return None
-        return base64.b64encode(data).decode()
+        return base64.b64encode(raw).decode()
 
     async def storage_state(self) -> dict:
         # context-level: cookies + localStorage shared across all tabs
@@ -485,11 +538,81 @@ class PlaywrightSession:
             )
         except Exception:  # noqa: BLE001 — tab may be closing
             return
+        data = params["data"]
+        if asyncio.get_running_loop().time() < tab.hold_until:
+            # echo window after a sharp push: a capture makes Chromium re-emit a
+            # few 1x frames of unchanged content. Park the newest one; _sharpen
+            # forwards it only if the content really changed.
+            tab.held = data
+            return
+        await self._fanout(tab, data)
+        tab.last_frame = data
+        self._schedule_sharpen(tab)
+
+    async def _fanout(self, tab: _Tab, data: str) -> None:
         for send in list(tab.subs):
             try:
-                await send(params["data"])
+                await send(data)
             except Exception:  # noqa: BLE001
                 tab.subs.discard(send)
+
+    # ---- sharpen-on-idle ----------------------------------------------------
+    # The CDP screencast emits at CSS-pixel size no matter the device scale, so
+    # a 1280x800 JPEG gets upscaled on the viewer's stage and looks soft. When a
+    # tab stops repainting for `screencast_sharpen_delay`, push one extra frame
+    # captured at `screencast_sharp_scale`x. Frame headers keep the CSS size, so
+    # click mapping in the viewer is unaffected.
+    _HOLD = 0.6  # seconds to swallow capture echoes after a sharp push
+
+    def _sharpen_enabled(self, tab: _Tab) -> bool:
+        return tab.cdp is not None and self._cfg.screencast_sharp_scale > 1.0
+
+    def _schedule_sharpen(self, tab: _Tab) -> None:
+        if not self._sharpen_enabled(tab) or not tab.subs:
+            return
+        self._cancel_sharpen(tab)
+        tab.sharpen_task = asyncio.create_task(self._sharpen(tab))
+
+    @staticmethod
+    def _cancel_sharpen(tab: _Tab) -> None:
+        t, tab.sharpen_task = tab.sharpen_task, None
+        if t is not None and not t.done():
+            t.cancel()
+
+    async def _capture_sharp(self, tab: _Tab) -> str | None:
+        """One JPEG of the viewport at the sharp scale (base64), and open the
+        echo-hold window so the 1x frames the capture provokes are not forwarded."""
+        w, h = self._viewport_of(tab)
+        s = self._cfg
+        try:
+            r = await tab.cdp.send("Page.captureScreenshot", {
+                "format": "jpeg", "quality": s.screencast_quality,
+                "clip": {"x": 0, "y": 0, "width": w, "height": h,
+                         "scale": max(1.0, s.screencast_sharp_scale)},
+            })
+        except Exception:  # noqa: BLE001 — navigating / closing
+            return None
+        tab.hold_until = asyncio.get_running_loop().time() + self._HOLD
+        tab.held = None
+        return r["data"]
+
+    async def _sharpen(self, tab: _Tab) -> None:
+        while True:
+            await asyncio.sleep(self._cfg.screencast_sharpen_delay)
+            if not tab.subs or tab.cdp is None or not tab.streaming:
+                return
+            data = await self._capture_sharp(tab)
+            if data is None:
+                return
+            await self._fanout(tab, data)
+            await asyncio.sleep(self._HOLD)
+            tab.hold_until = 0.0
+            held, tab.held = tab.held, None
+            if held is None or held == tab.last_frame:
+                return  # echoes only — the sharp frame stands
+            # the page really changed under the hold: show it, then go again
+            await self._fanout(tab, held)
+            tab.last_frame = held
 
     def subscribe(self, send: Callable[[str], Awaitable[None]], tab_id: str | None = None) -> None:
         self._tab(tab_id).subs.add(send)
@@ -504,11 +627,12 @@ class PlaywrightSession:
     async def inject_mouse(
         self, x: float, y: float, type_: str = "mousePressed", tab_id: str | None = None
     ) -> None:
-        cdp = self._tab(tab_id).cdp
-        if cdp:
-            await cdp.send(
+        tab = self._tab(tab_id)
+        if tab.cdp:
+            await tab.cdp.send(
                 "Input.dispatchMouseEvent",
-                {"type": type_, "x": x, "y": y, "button": "left", "clickCount": 1},
+                {"type": type_, "x": self._to_page(tab, x), "y": self._to_page(tab, y),
+                 "button": "left", "clickCount": 1},
             )
 
     async def inject_key(
@@ -536,11 +660,12 @@ class PlaywrightSession:
     async def inject_scroll(
         self, x: float, y: float, dx: float, dy: float, tab_id: str | None = None
     ) -> None:
-        cdp = self._tab(tab_id).cdp
-        if cdp:
-            await cdp.send(
+        tab = self._tab(tab_id)
+        if tab.cdp:
+            await tab.cdp.send(
                 "Input.dispatchMouseEvent",
-                {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy},
+                {"type": "mouseWheel", "x": self._to_page(tab, x), "y": self._to_page(tab, y),
+                 "deltaX": self._to_page(tab, dx), "deltaY": self._to_page(tab, dy)},
             )
 
     async def close(self) -> None:
@@ -548,6 +673,7 @@ class PlaywrightSession:
         # server-side so a later ensure()/replica can reconnect by id.
         for tab in self._tabs.values():
             tab.streaming = False
+            self._cancel_sharpen(tab)
         await self._ob.close()
 
     async def release(self) -> None:
@@ -556,6 +682,7 @@ class PlaywrightSession:
         normal idle reap, which only detaches via close()."""
         for tab in self._tabs.values():
             tab.streaming = False
+            self._cancel_sharpen(tab)
         if self._ob.release is not None:
             await self._ob.release()
         else:

@@ -1,11 +1,11 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 
-const ThemeCtx = createContext({ theme: 'dark', setTheme: () => {} })
+const ThemeCtx = createContext({ theme: 'light', setTheme: () => {} })
 const KEY = 'ab_theme'
 
 export function ThemeProvider({ children }) {
   const [theme, setTheme] = useState(
-    () => document.documentElement.dataset.theme || 'dark'
+    () => document.documentElement.dataset.theme || 'light'
   )
   useEffect(() => {
     document.documentElement.dataset.theme = theme

@@ -4,7 +4,10 @@
 # files live in infra/; the build context is the repo root (this directory), and
 # .dockerignore stays here. Run `make help` for the full list.
 
-COMPOSE     := docker compose -f infra/docker-compose.yml
+# --env-file is explicit (not just relying on Compose's implicit .env pickup):
+# some Docker setups silently drop secret-looking var names (*_API_KEY,
+# BOOTSTRAP_*) from the implicit load, leaving them empty in the container.
+COMPOSE     := docker compose -f infra/docker-compose.yml --env-file .env
 RUN_SH      := infra/run.sh
 SCREEN_NAME := agenticemirates
 

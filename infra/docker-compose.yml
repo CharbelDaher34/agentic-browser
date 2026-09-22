@@ -24,7 +24,7 @@ services:
     image: agenticbrowser:latest
     restart: unless-stopped
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      - "${BACKEND_PORT:-10506}:8000"
     shm_size: "1gb"                     # Chromium needs a real /dev/shm
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
@@ -38,7 +38,7 @@ services:
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       BROWSERBASE_API_KEY: "${BROWSERBASE_API_KEY:-}"
       BROWSERBASE_PROJECT_ID: "${BROWSERBASE_PROJECT_ID:-}"
-      ALLOW_REGISTRATION: "${ALLOW_REGISTRATION:-false}"
+      ALLOW_REGISTRATION: "${ALLOW_REGISTRATION:-true}"
       BOOTSTRAP_USERNAME: "${BOOTSTRAP_USERNAME:-}"
       BOOTSTRAP_PASSWORD: "${BOOTSTRAP_PASSWORD:-}"
     depends_on:

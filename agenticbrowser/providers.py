@@ -87,7 +87,7 @@ class LocalProvider(BrowserProvider):
         # restoring the FULL storage_state (cookies + localStorage/origins) at
         # context creation is the only way Playwright rehydrates localStorage.
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": self._cfg.viewport_width, "height": self._cfg.viewport_height},
             storage_state=storage_state or None,
             user_agent=_STEALTH_UA,
             locale="en-US",
